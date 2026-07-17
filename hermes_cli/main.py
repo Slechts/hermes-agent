@@ -5904,6 +5904,11 @@ def cmd_gui(args: argparse.Namespace):
             print("✗ Could not install the Hermes desktop launcher.")
             sys.exit(1)
 
+    # If the user only asked to install the launcher, we've either done it above
+    # or failed; don't fall through to build-only/launch logic.
+    if install_launcher_only:
+        return
+
     if getattr(args, "build_only", False):
         if source_mode:
             if not _desktop_dist_exists(desktop_dir):
