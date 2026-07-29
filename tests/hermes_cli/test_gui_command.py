@@ -123,10 +123,49 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
     assert "/usr/bin" in path_parts  # the bare updater PATH is preserved, just after managed Node
 
 
+def test_gui_linux_build_only_rejects_unlaunchable_sandbox(tmp_path, monkeypatch):
+    """Updater rebuilds must not report success with a broken SUID helper."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch, platform="linux")
+
+    with patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False) as mock_fixup, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True, build_only=True))
+
+    assert exc.value.code == 1
+    mock_fixup.assert_called_once()
 
 
+def test_gui_linux_sandbox_uses_pkexec_without_interactive_terminal(tmp_path, monkeypatch):
+    """Desktop-driven updates need a graphical privilege prompt, not sudo."""
+    root = _make_desktop_tree(tmp_path)
+    packaged_exe = _make_packaged_executable(root, monkeypatch, platform="linux")
+    sandbox = packaged_exe.parent / "chrome-sandbox"
+    sandbox.write_text("", encoding="utf-8")
+    sandbox.chmod(0o755)
+    ok = subprocess.CompletedProcess([], 0)
 
+    def which(command):
+        return {
+            "sudo": "/usr/bin/sudo",
+            "pkexec": "/usr/bin/pkexec",
+        }.get(command)
 
+    with patch("hermes_cli.main.sys.stdin.isatty", return_value=False), \
+         patch("hermes_cli.main.shutil.which", side_effect=which), \
+         patch("hermes_cli.main.subprocess.run", return_value=ok) as mock_run:
+        assert cli_main._desktop_linux_sandbox_fixup(packaged_exe) is True
+
+    mock_run.assert_called_once()
+    assert mock_run.call_args.args[0] == [
+        "/usr/bin/pkexec",
+        "/bin/sh",
+        "-c",
+        'chown root:root "$1" && chmod 4755 "$1"',
+        "hermes-desktop-sandbox",
+        str(sandbox),
+    ]
 
 
 # ── Content-hash stamp tests ──────────────────────────────────────────

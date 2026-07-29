@@ -6818,16 +6818,44 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
         return True
 
     sudo = shutil.which("sudo")
-    if not sudo:
-        print("✗ Hermes Desktop requires sudo to configure Electron's Linux sandbox helper.")
+    try:
+        has_interactive_terminal = bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, OSError):
+        has_interactive_terminal = False
+
+    if sudo and has_interactive_terminal:
+        print("→ Configuring Electron Linux sandbox helper (sudo required)...")
+        for command in ([sudo, "chown", "root:root", str(sandbox)], [sudo, "chmod", "4755", str(sandbox)]):
+            if subprocess.run(command, check=False).returncode != 0:
+                print(f"✗ Failed to configure Electron's Linux sandbox helper: {sandbox}")
+                return False
+        return True
+
+    # Desktop-driven updates and .desktop launchers have no interactive stdin,
+    # so sudo cannot request a password.  PolicyKit is the correct graphical
+    # authorization path.  Pass the sandbox as $1 rather than interpolating it
+    # into shell code so paths cannot alter the privileged command.
+    pkexec = shutil.which("pkexec")
+    if pkexec:
+        print("→ Configuring Electron Linux sandbox helper (system authorization required)...")
+        command = [
+            pkexec,
+            "/bin/sh",
+            "-c",
+            'chown root:root "$1" && chmod 4755 "$1"',
+            "hermes-desktop-sandbox",
+            str(sandbox),
+        ]
+        if subprocess.run(command, check=False).returncode == 0:
+            return True
+        print(f"✗ Failed to configure Electron's Linux sandbox helper: {sandbox}")
         return False
 
-    print("→ Configuring Electron Linux sandbox helper (sudo required)...")
-    for command in ([sudo, "chown", "root:root", str(sandbox)], [sudo, "chmod", "4755", str(sandbox)]):
-        if subprocess.run(command, check=False).returncode != 0:
-            print(f"✗ Failed to configure Electron's Linux sandbox helper: {sandbox}")
-            return False
-    return True
+    if sudo:
+        print("✗ Hermes Desktop requires an interactive terminal for sudo, or pkexec for graphical authorization.")
+    else:
+        print("✗ Hermes Desktop requires sudo or pkexec to configure Electron's Linux sandbox helper.")
+    return False
 
 
 def _desktop_launch_options() -> tuple[list[str], str]:
@@ -7084,6 +7112,12 @@ def cmd_gui(args: argparse.Namespace):
         elif packaged_executable is None:
             print(f"✗ --build-only produced no launchable app at: {desktop_dir / 'release'}")
             print("  Expected an unpacked Electron app for the current OS.")
+            sys.exit(1)
+        elif not _desktop_linux_sandbox_fixup(packaged_executable):
+            # The update path relaunches the packaged executable directly, so it
+            # cannot rely on the normal `hermes desktop` launch-time repair.
+            # Never report a Linux rebuild as successful while Electron's SUID
+            # helper would make that direct relaunch abort immediately.
             sys.exit(1)
         else:
             print(f"✓ Desktop packaged app ready: {packaged_executable} (not launching; --build-only)")
