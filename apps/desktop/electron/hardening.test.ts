@@ -72,6 +72,27 @@ test('attachment data URL helper reads bytes above the preview default without c
   }
 })
 
+test('preview data URL helper treats a stale missing path as an empty result only when opted in', async () => {
+  const missingPath = path.join(os.tmpdir(), 'hermes-desktop-missing-preview.png')
+
+  await assert.rejects(
+    readFileDataUrlForIpc(missingPath, {
+      mimeType: 'image/png',
+      purpose: 'Attachment upload'
+    }),
+    /file does not exist/
+  )
+
+  assert.equal(
+    await readFileDataUrlForIpc(missingPath, {
+      mimeType: 'image/png',
+      missingAsEmpty: true,
+      purpose: 'File preview'
+    }),
+    ''
+  )
+})
+
 test('resolveTimeoutMs falls back to defaults and accepts overrides', () => {
   assert.equal(resolveTimeoutMs(undefined), DEFAULT_FETCH_TIMEOUT_MS)
   assert.equal(resolveTimeoutMs(0), DEFAULT_FETCH_TIMEOUT_MS)

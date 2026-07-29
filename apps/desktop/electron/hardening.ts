@@ -337,13 +337,29 @@ async function readFileDataUrlForIpc(
     blockSensitive?: boolean
     maxBytes?: number
     mimeType: string
+    missingAsEmpty?: boolean
   }
 ): Promise<string> {
   const fsImpl = options.fs || fs
-  const { resolvedPath } = await resolveReadableFileForIpc(filePath, options)
-  const data = await fsImpl.promises.readFile(resolvedPath)
 
-  return `data:${options.mimeType};base64,${data.toString('base64')}`
+  try {
+    const { resolvedPath } = await resolveReadableFileForIpc(filePath, options)
+    const data = await fsImpl.promises.readFile(resolvedPath)
+
+    return `data:${options.mimeType};base64,${data.toString('base64')}`
+  } catch (error) {
+    const code = error && typeof error === 'object' ? (error as any).code : ''
+
+    // Preview targets are ephemeral: generated/composer files can disappear
+    // between rendering a prior message and the next Desktop launch. Treat
+    // only that stale-path race as an empty preview. Attachments remain strict,
+    // and security/permission/size failures must still surface to the caller.
+    if (options.missingAsEmpty && (code === 'ENOENT' || code === 'ENOTDIR')) {
+      return ''
+    }
+
+    throw error
+  }
 }
 
 export {
