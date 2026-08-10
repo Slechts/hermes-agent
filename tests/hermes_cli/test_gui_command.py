@@ -164,11 +164,12 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
     assert "/usr/bin" in path_parts  # the bare updater PATH is preserved, just after managed Node
 
 
+@pytest.mark.linux_only
 def test_gui_linux_build_only_rejects_unlaunchable_sandbox(tmp_path, monkeypatch):
     """Updater rebuilds must not report success with a broken SUID helper."""
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
-    _make_packaged_executable(root, monkeypatch, platform="linux")
+    _make_packaged_executable(root, monkeypatch)
 
     with patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False) as mock_fixup, \
          pytest.raises(SystemExit) as exc:
@@ -178,10 +179,11 @@ def test_gui_linux_build_only_rejects_unlaunchable_sandbox(tmp_path, monkeypatch
     mock_fixup.assert_called_once()
 
 
+@pytest.mark.linux_only
 def test_gui_linux_sandbox_uses_pkexec_without_interactive_terminal(tmp_path, monkeypatch):
     """Desktop-driven updates need a graphical privilege prompt, not sudo."""
     root = _make_desktop_tree(tmp_path)
-    packaged_exe = _make_packaged_executable(root, monkeypatch, platform="linux")
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
     sandbox = packaged_exe.parent / "chrome-sandbox"
     sandbox.write_text("", encoding="utf-8")
     sandbox.chmod(0o755)
