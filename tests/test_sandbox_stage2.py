@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).parents[1]
+DEV_SANDBOX = REPO_ROOT / "scripts" / "dev-sandbox.sh"
 STAGE2 = REPO_ROOT / "scripts" / "sandbox" / "stage2-run.sh"
 
 
@@ -66,16 +67,17 @@ def test_host_runtime_does_not_inject_host_node_headers(tmp_path: Path) -> None:
     )
 
 
-def test_nix_runtime_does_not_pin_headers_for_a_replaceable_node() -> None:
-    source = STAGE2.read_text(encoding="utf-8")
-    function = _extract_shell_function(source, "configure_node_env")
+def test_install_shortcut_targets_future_managed_node_headers() -> None:
+    source = DEV_SANDBOX.read_text(encoding="utf-8")
+    function = _extract_shell_function(source, "configure_node_dir")
     command = f"""
 set -euo pipefail
 {function}
-USE_HOST_RUNTIME=false
-DEV_SANDBOX_NODE_DIR=/nix/store/nodejs-22
-configure_node_env
-printf '%s\\n' "${{#node_env[@]}}"
+INSTALL_SHORTCUT=true
+SANDBOX_HOME=/home/hermes
+DEV_SANDBOX_NODE_DIR=
+configure_node_dir
+printf '%s\\n' "$NODE_DIR"
 """
     result = subprocess.run(
         ["bash", "-c", command],
@@ -83,4 +85,54 @@ printf '%s\\n' "${{#node_env[@]}}"
         capture_output=True,
         text=True,
     )
-    assert result.stdout == "0\n"
+    assert result.stdout == "/home/hermes/.hermes/node\n"
+
+
+def test_managed_node_headers_are_injected_after_install() -> None:
+    source = STAGE2.read_text(encoding="utf-8")
+    function = _extract_shell_function(source, "configure_node_env")
+    command = f"""
+set -euo pipefail
+{function}
+USE_HOST_RUNTIME=true
+DEV_SANDBOX_HOME=/home/hermes
+DEV_SANDBOX_NODE_DIR=/home/hermes/.hermes/node
+configure_node_env
+printf '%s\\n' "${{node_env[@]}}"
+"""
+    result = subprocess.run(
+        ["bash", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == (
+        "--setenv\n"
+        "npm_config_nodedir\n"
+        "/home/hermes/.hermes/node\n"
+    )
+
+
+def test_nix_runtime_preserves_immutable_node_headers() -> None:
+    source = STAGE2.read_text(encoding="utf-8")
+    function = _extract_shell_function(source, "configure_node_env")
+    command = f"""
+set -euo pipefail
+{function}
+USE_HOST_RUNTIME=false
+DEV_SANDBOX_HOME=/home/hermes
+DEV_SANDBOX_NODE_DIR=/nix/store/nodejs-22
+configure_node_env
+printf '%s\\n' "${{node_env[@]}}"
+"""
+    result = subprocess.run(
+        ["bash", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == (
+        "--setenv\n"
+        "npm_config_nodedir\n"
+        "/nix/store/nodejs-22\n"
+    )

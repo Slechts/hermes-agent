@@ -86,14 +86,23 @@ else
   USE_HOST_RUNTIME=true
 fi
 
-# Never pin node-gyp to the Node headers discovered before entering the sandbox.
-# A host prefix such as /usr/local may be hidden by the sandbox mounts, and the
-# installer can replace Node after startup (for example Node 22 -> 26). In both
-# cases npm_config_nodedir would either be inaccessible or select headers for the
-# wrong ABI. Leave it unset so node-gyp resolves headers for the Node process
-# that actually executes the native build.
+# Only pass node-gyp a header prefix that remains visible in the sandbox. An
+# install shortcut targets the managed Node prefix under sandbox HOME; the
+# installer populates matching include/node headers there before npm runs. A
+# Nix store prefix is immutable and /nix is mounted read-only. Host prefixes
+# such as /usr/local are hidden by sandbox mounts and must not leak through.
 configure_node_env() {
   node_env=()
+  case "${DEV_SANDBOX_NODE_DIR:-}" in
+    "$DEV_SANDBOX_HOME"/*)
+      node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+      ;;
+    /nix/*)
+      if [ "$USE_HOST_RUNTIME" = false ]; then
+        node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+      fi
+      ;;
+  esac
 }
 configure_node_env
 
