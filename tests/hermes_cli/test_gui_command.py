@@ -1265,3 +1265,81 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
     mock_detect.assert_not_called()
     launch_env = mock_run.call_args_list[1].kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
+
+
+@pytest.mark.linux_only
+def test_gui_linux_build_only_rejects_unlaunchable_sandbox(tmp_path, monkeypatch):
+    """Updater rebuilds must not report success with a broken SUID helper."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch)
+
+    with patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False) as mock_fixup, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True, build_only=True))
+
+    assert exc.value.code == 1
+    mock_fixup.assert_called_once()
+
+
+
+@pytest.mark.linux_only
+def test_gui_linux_sandbox_uses_pkexec_without_interactive_terminal(tmp_path, monkeypatch):
+    """Desktop-driven updates need a graphical privilege prompt, not sudo."""
+    root = _make_desktop_tree(tmp_path)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+    sandbox = packaged_exe.parent / "chrome-sandbox"
+    sandbox.write_text("", encoding="utf-8")
+    sandbox.chmod(0o755)
+    ok = subprocess.CompletedProcess([], 0)
+
+    def which(command):
+        return {
+            "sudo": "/usr/bin/sudo",
+            "pkexec": "/usr/bin/pkexec",
+        }.get(command)
+
+    # Neither a controlling terminal nor passwordless sudo is available.
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1) if command[0] == "/usr/bin/sudo" else ok
+
+    with patch("hermes_cli.main.sys.stdin.isatty", return_value=False), \
+         patch("hermes_cli.main.open", side_effect=OSError("no controlling tty"), create=True), \
+         patch("hermes_cli.main.shutil.which", side_effect=which), \
+         patch("hermes_cli.main.subprocess.run", side_effect=run) as mock_run:
+        assert cli_main._desktop_linux_sandbox_fixup(packaged_exe) is True
+
+    assert mock_run.call_count == 2
+    assert mock_run.call_args_list[0].args[0] == [
+        "/usr/bin/sudo", "-n", "chown", "root:root", str(sandbox)
+    ]
+    assert mock_run.call_args.args[0] == [
+        "/usr/bin/pkexec",
+        "/bin/sh",
+        "-c",
+        'chown root:root "$1" && chmod 4755 "$1"',
+        "hermes-desktop-sandbox",
+        str(sandbox),
+    ]
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("controlling_tty", [True, False], ids=["redirected-stdin-with-tty", "headless-passwordless-sudo"])
+def test_gui_linux_sandbox_keeps_available_sudo_with_redirected_stdin(tmp_path, monkeypatch, controlling_tty):
+    """Redirected stdin must not prevent terminal or non-interactive sudo."""
+    root = _make_desktop_tree(tmp_path)
+    executable = _make_packaged_executable(root, monkeypatch)
+    sandbox = executable.parent / "chrome-sandbox"
+    sandbox.write_text("", encoding="utf-8")
+    sandbox.chmod(0o755)
+    tty_options = {} if controlling_tty else {"side_effect": OSError("no controlling tty")}
+    with patch("hermes_cli.main.sys.stdin.isatty", return_value=False), \
+         patch("hermes_cli.main.open", create=True, **tty_options), \
+         patch("hermes_cli.main.shutil.which", side_effect=lambda name: "/usr/bin/sudo" if name == "sudo" else None), \
+         patch("hermes_cli.main.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+        assert cli_main._desktop_linux_sandbox_fixup(executable) is True
+    prefix = ["/usr/bin/sudo"] + ([] if controlling_tty else ["-n"])
+    assert [call.args[0] for call in run.call_args_list] == [
+        [*prefix, "chown", "root:root", str(sandbox)],
+        [*prefix, "chmod", "4755", str(sandbox)],
+    ]

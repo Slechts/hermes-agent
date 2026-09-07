@@ -20,12 +20,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # script into the store on its own, so it exports DEV_SANDBOX_ASSETS to point
 # here.
 SANDBOX_ASSETS="${DEV_SANDBOX_ASSETS:-$SCRIPT_DIR/sandbox}"
-for asset in proxy.py ssh-shim.sh openssl.cnf stage2-run.sh; do
+for asset in proxy.py ssh-shim.sh openssl.cnf node-headers.sh stage2-run.sh; do
   [ -f "$SANDBOX_ASSETS/$asset" ] || {
     echo "error: missing sandbox asset: $SANDBOX_ASSETS/$asset" >&2
     exit 1
   }
 done
+. "$SANDBOX_ASSETS/node-headers.sh"
 
 print_help() {
   cat <<'EOF'
@@ -480,10 +481,13 @@ INTERACTIVE=false
 if [ -t 0 ] && [ -t 1 ]; then
   INTERACTIVE=true
 fi
-NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"
-if [ -z "$NODE_DIR" ] && command -v node >/dev/null; then
-  NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"
+DISCOVERED_NODE_DIR=""
+if command -v node >/dev/null; then
+  DISCOVERED_NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"
 fi
+NODE_DIR="$(sandbox_select_node_dir \
+  "${DEV_SANDBOX_NODE_DIR:-}" "$INSTALL_SHORTCUT" "$SANDBOX_HOME" \
+  "$DISCOVERED_NODE_DIR")"
 WAYLAND_SOCKET=""
 if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
   && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then

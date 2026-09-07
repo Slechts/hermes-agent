@@ -87,21 +87,26 @@ step() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-# The sandbox's internal logs (fake-internet proxy, slirp) explain failures that
-# happen BEFORE install.sh gets to say anything -- a TLS handshake the proxy
-# rejected looks like a bare `curl: (35)` from outside. Copy them out where a CI
-# artifact upload can find them, and echo the proxy log since it is the usual
-# culprit.
+# The sandbox's internal logs explain failures that happen before install.sh can
+# report the cause. Preserve both the fake-internet logs and npm's debug log:
+# older installers run npm with --silent, so the latter can be the only record
+# of the first causal package or lifecycle failure.
 collect_sandbox_logs() {
   # Separate `local` statements on purpose: a single `local a=$1 b="$a"` does
   # NOT see the earlier assignment, so under `set -u` the second expansion dies
   # with "a: unbound variable".
   local tag="$1"
-  local src="$SANDBOX_ROOT/root/logs"
+  local proxy_src="$SANDBOX_ROOT/root/logs"
+  local npm_src="$SANDBOX_ROOT/home/.npm/_logs"
   local dest="$LOG_DIR/sandbox-$tag"
-  [ -d "$src" ] || return 0
   mkdir -p "$dest"
-  cp -a "$src/." "$dest/" 2>/dev/null || true
+  if [ -d "$proxy_src" ]; then
+    cp -a "$proxy_src/." "$dest/" 2>/dev/null || true
+  fi
+  if [ -d "$npm_src" ]; then
+    mkdir -p "$dest/npm"
+    cp -a "$npm_src/." "$dest/npm/" 2>/dev/null || true
+  fi
   # Print it, not just archive it: a rejected TLS handshake here is the whole
   # explanation for a failure that otherwise reads as a bare `curl: (35)`, and
   # whoever is reading the job log should not have to download an artifact to

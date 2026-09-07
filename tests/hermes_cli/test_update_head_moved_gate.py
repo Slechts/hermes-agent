@@ -14,6 +14,9 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import main as hermes_main
+from tests.hermes_cli.update_fixture_isolation import (
+    isolate_update_runtime_boundaries,
+)
 
 
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
@@ -72,6 +75,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     attributes on that module is the canonical test surface (matches
     tests/hermes_cli/test_cmd_update.py).
     """
+    isolation = isolate_update_runtime_boundaries(monkeypatch)
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
@@ -103,34 +107,22 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     # Short-circuit the long tail: dependency install + desktop build.
     monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
-    # Gateway restart path (called after a successful update).
-    monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a: None)
-    # Keep the (now surfaced — #78574) gateway auto-restart phase away from
-    # this machine's real gateways: discovery returns nothing, systemd is
-    # unsupported, so the phase is a clean no-op for both snapshots.
-    import hermes_cli.gateway as hermes_gateway
-
-    monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
-    )
-    monkeypatch.setattr(
-        hermes_gateway, "supports_systemd_services", lambda: False
-    )
-    monkeypatch.setattr(
-        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
-    )
+    return isolation
 
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
-    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    isolation = _patch_update_deps(
+        monkeypatch, tmp_path, _make_head_moved_side_effect()
+    )
 
     hermes_main.cmd_update(args)  # completes normally (no SystemExit)
 
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
     assert "Code did not move" not in out
+    isolation.assert_mocked_runtime_boundaries_used()
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):

@@ -1,0 +1,201 @@
+name: QA Native Candidate
+
+# Disposable QA only. The unpacked bundles and evidence are not release
+# artifacts. This workflow does not cover signing, notarization, native
+# notifications, a real backend, or first-run installation.
+
+on:
+  push:
+    branches:
+      - qa/electron42-native-20260907
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Fixed source and target preflight
+    if: >-
+      github.repository == 'Slechts/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/qa/electron42-native-20260907' && github.sha == github.event.after
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, node24
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0, node24
+        with:
+          node-version: '22.23.1'
+          package-manager-cache: false
+
+      - name: Prepare preflight evidence directory
+        shell: bash
+        run: mkdir -p "$RUNNER_TEMP/qa-native-preflight"
+
+      - name: Validate fixed source and target metadata
+        shell: bash
+        env:
+          QA_SOURCE_SHA: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+          QA_BASE_SHA: 29112bef099274229cadff79cdff7bf7b99c4b77
+          QA_TARGET_SHA: ${{ github.sha }}
+          QA_PREFLIGHT_RECEIPT: ${{ runner.temp }}/qa-native-preflight/preflight.json
+        run: |
+          set -euo pipefail
+          node apps/desktop/qa-native/support.mjs preflight 2>&1 \
+            | tee "$RUNNER_TEMP/qa-native-preflight/preflight.log"
+
+      - name: Upload preflight QA evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, node24
+        with:
+          name: qa-native-${{ github.sha }}-ubuntu-24.04-preflight
+          path: ${{ runner.temp }}/qa-native-preflight
+          retention-days: 7
+          if-no-files-found: error
+
+  native-desktop:
+    name: Packaged GUI smoke (${{ matrix.os }}-${{ matrix.arch }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-24.04
+            arch: x64
+          - os: windows
+            runner: windows-2025
+            arch: x64
+          - os: macos
+            runner: macos-15
+            arch: arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, node24
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0, node24
+        with:
+          node-version: '22.23.1'
+          package-manager-cache: false
+
+      - name: Prepare runner-temp QA paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          qa_output="$RUNNER_TEMP/qa-native-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "$qa_output"
+          {
+            echo "QA_NATIVE_OUTPUT_DIR=$qa_output"
+            echo "QA_NATIVE_RESULTS_JSON=$qa_output/playwright-results.json"
+            echo "QA_NATIVE_RUNTIME_RECEIPT=$qa_output/runtime-receipt.json"
+            echo "QA_NATIVE_FINAL_RECEIPT=$qa_output/final-receipt.json"
+            echo "QA_NATIVE_OS=${{ matrix.os }}"
+            echo "QA_NATIVE_ARCH=${{ matrix.arch }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Ubuntu GUI runtime dependencies
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+
+      - name: Install and verify locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.23.1"
+          test "$(npm --version)" = "10.9.8"
+          npm ci 2>&1 | tee "$QA_NATIVE_OUTPUT_DIR/npm-ci.log"
+          npm audit --audit-level=low 2>&1 | tee "$QA_NATIVE_OUTPUT_DIR/npm-audit.log"
+          npm ls --all 2>&1 | tee "$QA_NATIVE_OUTPUT_DIR/npm-ls.log"
+          node apps/desktop/qa-native/support.mjs install-electron 2>&1 \
+            | tee "$QA_NATIVE_OUTPUT_DIR/electron-install.log"
+
+      - name: Build unsigned unpacked Desktop bundle
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          set -euo pipefail
+          npm run pack --workspace=apps/desktop 2>&1 \
+            | tee "$QA_NATIVE_OUTPUT_DIR/desktop-pack.log"
+
+      - name: Configure packaged Linux sandbox helper
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sandbox_helper=apps/desktop/release/linux-unpacked/chrome-sandbox
+          test -f "$sandbox_helper"
+          sudo chown root:root "$sandbox_helper"
+          sudo chmod 4755 "$sandbox_helper"
+          test "$(stat -c '%u:%g' "$sandbox_helper")" = "0:0"
+          test "$(stat -c '%a' "$sandbox_helper")" = "4755"
+          stat "$sandbox_helper" | tee "$QA_NATIVE_OUTPUT_DIR/chrome-sandbox-stat.log"
+
+      - name: Run packaged GUI smoke with loopback gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          playwright=(
+            node node_modules/@playwright/test/cli.js test
+            --config=apps/desktop/qa-native/playwright.config.mjs
+          )
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+              xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+              "${playwright[@]}" 2>&1 | tee "$QA_NATIVE_OUTPUT_DIR/playwright.log"
+          else
+            "${playwright[@]}" 2>&1 | tee "$QA_NATIVE_OUTPUT_DIR/playwright.log"
+          fi
+
+      - name: Require complete non-flaky Playwright results
+        shell: bash
+        run: |
+          set -euo pipefail
+          node apps/desktop/qa-native/support.mjs check-results \
+            --results "$QA_NATIVE_RESULTS_JSON" \
+            --runtime-receipt "$QA_NATIVE_RUNTIME_RECEIPT" \
+            --receipt "$QA_NATIVE_FINAL_RECEIPT" \
+            --sha "$GITHUB_SHA" 2>&1 \
+            | tee "$QA_NATIVE_OUTPUT_DIR/results-gate.log"
+
+      - name: Upload native QA evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, node24
+        with:
+          name: qa-native-${{ github.sha }}-${{ matrix.os }}-${{ matrix.arch }}-packaged-gui-smoke
+          path: ${{ runner.temp }}/qa-native-${{ matrix.os }}-${{ matrix.arch }}
+          retention-days: 7
+          if-no-files-found: error
+
+  update:
+    name: Update route from fixed v2026.8.27 source
+    needs: preflight
+    uses: ./.github/workflows/install-e2e-run.yml
+    with:
+      route: update
+      install-ref: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+      runner: ubuntu-24.04
+      timeout-minutes: 45
+
+  installer:
+    name: Installer route from fixed v2026.8.27 source
+    needs: preflight
+    uses: ./.github/workflows/install-e2e-run.yml
+    with:
+      route: installer
+      install-ref: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+      runner: ubuntu-24.04
+      timeout-minutes: 45

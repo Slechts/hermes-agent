@@ -12,7 +12,17 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+from tests.hermes_cli.update_fixture_isolation import (
+    isolate_update_runtime_boundaries,
+)
+
+
+@pytest.fixture
+def update_boundary_isolation(monkeypatch):
+    return isolate_update_runtime_boundaries(monkeypatch)
 
 
 def _make_run_side_effect(
@@ -67,6 +77,7 @@ class TestUpdateYesConfigMigration:
         mock_migrate,
         _mock_reload,
         capsys,
+        update_boundary_isolation,
     ):
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="1"
@@ -90,6 +101,7 @@ class TestUpdateYesConfigMigration:
         assert "--yes: auto-applying config migration" in out
         # The "Would you like to configure them now?" prompt text never appears.
         assert "Would you like to configure them now?" not in out
+        update_boundary_isolation.assert_mocked_runtime_boundaries_used()
 
     @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
@@ -108,6 +120,7 @@ class TestUpdateYesConfigMigration:
         mock_migrate,
         _mock_reload,
         capsys,
+        update_boundary_isolation,
     ):
         """Regression guard: without --yes, the TTY prompt path still fires."""
         mock_run.side_effect = _make_run_side_effect(
@@ -134,6 +147,7 @@ class TestUpdateYesConfigMigration:
             assert mock_input.called
             prompts = [c.args[0] if c.args else "" for c in mock_input.call_args_list]
             assert any("configure them now" in p for p in prompts)
+        update_boundary_isolation.assert_mocked_runtime_boundaries_used()
 
 
 class TestUpdateYesStashRestore:
@@ -168,6 +182,7 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
         mock_migrate,
         _mock_reload,
         capsys,
+        update_boundary_isolation,
     ):
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="1"
@@ -188,6 +203,7 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
         out = capsys.readouterr().out
         assert "hermes config migrate" in out
         mock_migrate.assert_not_called()
+        update_boundary_isolation.assert_mocked_runtime_boundaries_used()
 
     def test_stash_restore_unicode_decode_error_falls_through_to_skip(self, tmp_path, capsys):
         from hermes_cli.update_cmd import _restore_stashed_changes

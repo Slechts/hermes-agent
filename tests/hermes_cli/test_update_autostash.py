@@ -7,6 +7,9 @@ import pytest
 
 from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
+from tests.hermes_cli.update_fixture_isolation import (
+    isolate_update_runtime_boundaries,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +60,7 @@ def _patch_managed_uv(request):
 
 def _setup_update_mocks(monkeypatch, tmp_path):
     """Common setup for cmd_update tests."""
+    isolation = isolate_update_runtime_boundaries(monkeypatch)
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
@@ -67,6 +71,7 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+    return isolation
 
 
 
@@ -236,7 +241,7 @@ def _setup_setting_test(monkeypatch, tmp_path, mode):
 def _setup_keep_stash_test(monkeypatch, tmp_path):
     """Wiring for --keep-stash tests: stash returns a ref; restore, discard,
     and park are all recorded."""
-    _setup_update_mocks(monkeypatch, tmp_path)
+    isolation = _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
     monkeypatch.setattr(
         hermes_main, "_stash_local_changes_if_needed",
@@ -257,19 +262,15 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
         hermes_main, "_park_stashed_changes",
         lambda *a, **kw: park_calls.append(a) or None,
     )
-    # Keep the update flow away from the real gateway fleet on this machine —
-    # a live gateway PID would trip the test-suite kill guard and turn the
-    # run into exit 1 (gateway_fleet_restart_incomplete).
-    monkeypatch.setattr(
-        "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
-    )
-    return restore_calls, discard_calls, park_calls
+    return restore_calls, discard_calls, park_calls, isolation
 
 
 def test_update_keep_stash_parks_instead_of_restoring(monkeypatch, tmp_path):
     """--keep-stash: after a successful update, the autostash is parked (left
     in git stash) — never re-applied, never discarded."""
-    restore_calls, discard_calls, park_calls = _setup_keep_stash_test(monkeypatch, tmp_path)
+    restore_calls, discard_calls, park_calls, isolation = _setup_keep_stash_test(
+        monkeypatch, tmp_path
+    )
     side_effect, _ = _make_update_side_effect()
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -279,12 +280,15 @@ def test_update_keep_stash_parks_instead_of_restoring(monkeypatch, tmp_path):
     assert park_calls[0][0] == "abc123deadbeef"
     assert restore_calls == []
     assert discard_calls == []
+    isolation.assert_mocked_runtime_boundaries_used()
 
 
 def test_update_without_keep_stash_still_restores(monkeypatch, tmp_path):
     """Regression guard: default behavior (no --keep-stash) is unchanged —
     the autostash is auto-restored under --yes."""
-    restore_calls, discard_calls, park_calls = _setup_keep_stash_test(monkeypatch, tmp_path)
+    restore_calls, discard_calls, park_calls, isolation = _setup_keep_stash_test(
+        monkeypatch, tmp_path
+    )
     side_effect, _ = _make_update_side_effect()
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -293,12 +297,15 @@ def test_update_without_keep_stash_still_restores(monkeypatch, tmp_path):
     assert restore_calls == [1]
     assert park_calls == []
     assert discard_calls == []
+    isolation.assert_mocked_runtime_boundaries_used()
 
 
 def test_update_keep_stash_failure_path_still_preserves(monkeypatch, tmp_path, capsys):
     """--keep-stash + failed update: neither restore nor park runs; the
     existing preserved-in-stash message fires (working tree unknown)."""
-    restore_calls, discard_calls, park_calls = _setup_keep_stash_test(monkeypatch, tmp_path)
+    restore_calls, discard_calls, park_calls, _isolation = _setup_keep_stash_test(
+        monkeypatch, tmp_path
+    )
     side_effect, _ = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 

@@ -24,6 +24,9 @@ import pytest
 from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
 from hermes_constants import get_hermes_home
+from tests.hermes_cli.update_fixture_isolation import (
+    isolate_update_runtime_boundaries,
+)
 
 
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
@@ -72,6 +75,7 @@ def _make_up_to_date_side_effect(sha="abc123"):
 
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Patch ``_cmd_update_impl`` helpers. Mirrors test_update_head_moved_gate."""
+    isolation = isolate_update_runtime_boundaries(monkeypatch)
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()
@@ -108,23 +112,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
     monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
 
-    import hermes_cli.gateway as hermes_gateway
-
-    monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
-    )
-    monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
-    monkeypatch.setattr(
-        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
-    )
-    monkeypatch.setattr(
-        "hermes_cli.update_receipt.collect_fleet_versions",
-        lambda **k: [],
-    )
-    monkeypatch.setattr(
-        "hermes_cli.update_inventory.collect_runtime_inventory",
-        lambda: SimpleNamespace(runtimes=[], to_dict=lambda: {}),
-    )
+    return isolation
 
 
 def _update_args():
@@ -283,7 +271,9 @@ def test_marker_written_after_pull_cleared_after_successful_restart(
     monkeypatch, tmp_path, capsys
 ):
     args = _update_args()
-    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    isolation = _patch_update_deps(
+        monkeypatch, tmp_path, _make_head_moved_side_effect()
+    )
 
     wrote = []
     orig = update_cmd._write_fleet_restart_pending_marker
@@ -300,6 +290,7 @@ def test_marker_written_after_pull_cleared_after_successful_restart(
     assert not update_cmd._fleet_restart_pending_marker_path().exists()
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
+    isolation.assert_mocked_runtime_boundaries_used()
 
 
 def test_interrupt_between_pull_and_restart_leaves_marker(

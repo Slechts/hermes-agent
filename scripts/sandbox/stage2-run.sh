@@ -17,6 +17,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/node-headers.sh"
+
 : "${DEV_SANDBOX_ROOT:?missing DEV_SANDBOX_ROOT}"
 : "${DEV_SANDBOX_BASH:?missing DEV_SANDBOX_BASH}"
 : "${DEV_SANDBOX_INTERACTIVE:?missing DEV_SANDBOX_INTERACTIVE}"
@@ -47,10 +50,6 @@ if [ "$home_parent" != / ]; then
 fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
-node_env=()
-if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
-fi
 electron_env=()
 if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
   electron_env+=(
@@ -88,6 +87,16 @@ if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
   USE_HOST_RUNTIME=false
 else
   USE_HOST_RUNTIME=true
+fi
+
+# Only pass node-gyp a header prefix that remains visible in the sandbox.
+# Host prefixes such as /usr/local are hidden by sandbox mounts and must not
+# leak through; managed HOME and immutable Nix prefixes remain reachable.
+NODE_HEADERS_DIR="$(sandbox_visible_node_headers \
+  "$DEV_SANDBOX_HOME" "${DEV_SANDBOX_NODE_DIR:-}" "$USE_HOST_RUNTIME")"
+node_env=()
+if [ -n "$NODE_HEADERS_DIR" ]; then
+  node_env+=(--setenv npm_config_nodedir "$NODE_HEADERS_DIR")
 fi
 
 runtime_mounts=()
