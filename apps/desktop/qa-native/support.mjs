@@ -164,13 +164,18 @@ export function compareReleaseMetadata(left, right) {
 }
 
 
-export function resolvePackagedLayout({ platform, arch, releaseRoot }) {
+export function resolvePackagedLayout({ platform, arch, releaseRoot, productName, executableName }) {
+  const builder = JSON.parse(
+    fs.readFileSync(path.join(DESKTOP_ROOT, 'package.json'), 'utf8'),
+  ).build
+  productName ??= builder.productName
+  executableName ??= builder.executableName
   const layouts = {
-    'darwin/arm64': ['mac-arm64', 'Hermes.app', 'Contents', 'MacOS', 'Hermes'],
-    'darwin/x64': ['mac', 'Hermes.app', 'Contents', 'MacOS', 'Hermes'],
-    'linux/arm64': ['linux-arm64-unpacked', 'hermes'],
-    'linux/x64': ['linux-unpacked', 'hermes'],
-    'win32/x64': ['win-unpacked', 'Hermes.exe'],
+    'darwin/arm64': ['mac-arm64', `${productName}.app`, 'Contents', 'MacOS', executableName],
+    'darwin/x64': ['mac', `${productName}.app`, 'Contents', 'MacOS', executableName],
+    'linux/arm64': ['linux-arm64-unpacked', executableName],
+    'linux/x64': ['linux-unpacked', executableName],
+    'win32/x64': ['win-unpacked', `${executableName}.exe`],
   }
   const parts = layouts[`${platform}/${arch}`]
 
@@ -345,6 +350,7 @@ export async function startGatewayMock() {
   const state = {
     healthRequests: 0,
     httpPaths: [],
+    httpResponses: [],
     successfulAuthenticatedHttpPaths: [],
     rpcMethods: [],
     webSocketConnections: 0,
@@ -356,6 +362,11 @@ export async function startGatewayMock() {
   const server = http.createServer((request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1')
     state.httpPaths.push(url.pathname)
+    response.once('finish', () => {
+      if (state.httpResponses.length < 100) {
+        state.httpResponses.push({ path: url.pathname, method: request.method, status: response.statusCode })
+      }
+    })
 
     if (!authorized(request)) {
       writeGatewayMockJson(response, 401, { detail: 'invalid QA gateway token' })
@@ -448,6 +459,7 @@ export async function startGatewayMock() {
       healthRequests: state.healthRequests,
       webSocketConnections: state.webSocketConnections,
       httpPaths: [...state.httpPaths],
+      httpResponses: state.httpResponses.map(response => ({ ...response })),
       successfulAuthenticatedHttpPaths: [...state.successfulAuthenticatedHttpPaths],
       rpcMethods: [...state.rpcMethods],
     }),

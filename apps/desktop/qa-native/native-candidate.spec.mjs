@@ -5,6 +5,11 @@ import path from 'node:path'
 import { _electron, expect, test } from '@playwright/test'
 
 import {
+  collectNativeDiagnostics, observeNativeApp, readNativeDom, readNativeRuntime,
+  runWithDiagnostics, sanitizeDiagnostic, withDiagnosticTimeout,
+} from './diagnostics.mjs'
+
+import {
   buildElectronLaunchOptions,
   buildLaunchEnv,
   resolvePackagedLayout,
@@ -27,7 +32,10 @@ const BYPASS_SWITCHES = [
 ]
 
 
-test('packaged native candidate keeps runtime, renderer, and sandbox contracts', async () => {
+test('packaged native candidate keeps runtime, renderer, and sandbox contracts', async ({}, testInfo) => {
+  // Reserve time inside the existing outer timeout; never lengthen a readiness assertion.
+  const deadline = Date.now() + testInfo.timeout - 15_000
+  const budget = maximum => Math.max(1, Math.min(maximum, deadline - Date.now()))
   const outputDir = process.env.QA_NATIVE_OUTPUT_DIR
   const runtimeReceiptPath = process.env.QA_NATIVE_RUNTIME_RECEIPT
   const expectedOs = process.env.QA_NATIVE_OS
@@ -46,7 +54,6 @@ test('packaged native candidate keeps runtime, renderer, and sandbox contracts',
     arch: process.arch,
     releaseRoot: RELEASE_ROOT,
   })
-  expect(fs.existsSync(layout.binaryPath), `packaged binary must exist: ${layout.binaryPath}`).toBe(true)
 
   fs.mkdirSync(outputDir, { recursive: true })
   const sandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-native-qa-'))
@@ -79,124 +86,84 @@ test('packaged native candidate keeps runtime, renderer, and sandbox contracts',
     env,
   })
   let electronApp
+  let page
+  let observation
 
-  try {
-    electronApp = await _electron.launch(launchOptions)
-    const page = await electronApp.firstWindow()
-    await page.waitForSelector('#root', { state: 'attached', timeout: 30_000 })
-    await page.waitForFunction(() => {
-      const composer = document.querySelector('[data-slot="composer-rich-input"]')
-      const ariaDisabled = composer?.getAttribute('aria-disabled')
+  await runWithDiagnostics({
+    run: async () => {
+      expect(fs.existsSync(layout.binaryPath), `packaged binary must exist: ${layout.binaryPath}`).toBe(true)
+      electronApp = await _electron.launch({ ...launchOptions, timeout: budget(30_000) })
+      observation = observeNativeApp(electronApp, [gateway.token])
+      page = await electronApp.firstWindow({ timeout: budget(30_000) })
+      await page.waitForSelector('#root', { state: 'attached', timeout: budget(30_000) })
+      await page.waitForFunction(() => {
+        const composer = document.querySelector('[data-slot="composer-rich-input"]')
+        const ariaDisabled = composer?.getAttribute('aria-disabled')
 
-      return Boolean(
-        composer &&
-        composer.isContentEditable &&
-        ariaDisabled !== 'true' &&
-        document.querySelector('[class*="z-(--z-setup)"]') === null &&
-        document.querySelector('[data-glass-opaque]') === null
+        return Boolean(
+          composer &&
+          composer.isContentEditable &&
+          ariaDisabled !== 'true' &&
+          document.querySelector('[class*="z-(--z-setup)"]') === null &&
+          document.querySelector('[data-glass-opaque]') === null
+        )
+      }, undefined, {
+        timeout: budget(60_000),
+      })
+
+      const dom = await withDiagnosticTimeout(() => page.evaluate(readNativeDom), budget(15_000), 'DOM')
+      const runtime = await withDiagnosticTimeout(() => electronApp.evaluate(readNativeRuntime), budget(15_000), 'runtime')
+
+      const argvBypasses = runtime.processArguments.filter(argument =>
+        BYPASS_SWITCHES.some(name => argument === `--${name}` || argument.startsWith(`--${name}=`)),
       )
-    }, undefined, {
-      timeout: 60_000,
-    })
-
-    const dom = await page.evaluate(() => {
-      const root = document.getElementById('root')
-      const composer = document.querySelector('[data-slot="composer-rich-input"]')
-      const ariaDisabled = composer?.getAttribute('aria-disabled')
-      const text = root?.textContent ?? ''
-      const errorMarkers = [
-        'No QueryClient set',
-        'Something broke in the interface',
-        'Something went wrong',
-      ]
-      return {
-        childCount: root?.childElementCount ?? 0,
-        textLength: text.trim().length,
-        errorBoundaryAbsent:
-          root?.querySelector('[class*="z-(--z-crash)"]') === null &&
-          !errorMarkers.some(marker => text.includes(marker)),
-        bootReady: document.querySelector('[data-glass-opaque]') === null,
-        composerEnabled: Boolean(
-          composer && composer.isContentEditable && ariaDisabled !== 'true'
-        ),
-        overlayAbsent: document.querySelector('[class*="z-(--z-setup)"]') === null,
+      const runtimeReceipt = {
+        ...runtime,
+        domUseful: dom.childCount > 0 && dom.textLength > 0,
+        errorBoundaryAbsent: dom.errorBoundaryAbsent,
+        bootReady: dom.bootReady,
+        composerEnabled: dom.composerEnabled,
+        overlayAbsent: dom.overlayAbsent,
+        disableGpu: launchOptions.args.includes('--disable-gpu'),
+        bypassArguments: [...new Set([...runtime.bypassArguments, ...argvBypasses])],
+        gatewayMock: gateway.receipt(),
       }
-    })
 
-    const runtime = await electronApp.evaluate(({ app, BrowserWindow }) => {
-      const windows = BrowserWindow.getAllWindows()
-      const visibleWindow = windows.find(window => window.isVisible())
-      const window = visibleWindow ?? windows[0]
-      const preferences = window?.webContents.getLastWebPreferences() ?? {}
-      const bypassArguments = []
+      expect(runtimeReceipt.electronVersion).toBe(EXPECTED_ELECTRON_VERSION)
+      expect(runtimeReceipt.appVersion).toBe(DESKTOP_PACKAGE.version)
+      expect(runtimeReceipt.isPackaged).toBe(true)
+      expect(runtimeReceipt.platform).toBe(expectedPlatform)
+      expect(runtimeReceipt.arch).toBe(expectedArch)
+      expect(runtimeReceipt.windowVisible).toBe(true)
+      expect(runtimeReceipt.domUseful).toBe(true)
+      expect(runtimeReceipt.errorBoundaryAbsent).toBe(true)
+      expect(runtimeReceipt.bootReady).toBe(true)
+      expect(runtimeReceipt.composerEnabled).toBe(true)
+      expect(runtimeReceipt.overlayAbsent).toBe(true)
+      expect(runtimeReceipt.sandbox).toBe(true)
+      expect(runtimeReceipt.contextIsolation).toBe(true)
+      expect(runtimeReceipt.nodeIntegration).toBe(false)
+      expect(runtimeReceipt.bypassArguments).toEqual([])
 
-      for (const name of [
-        'no-sandbox',
-        'disable-setuid-sandbox',
-        'disable-seccomp-filter-sandbox',
-        'disable-seccomp-sandbox',
-        'no-zygote',
-      ]) {
-        if (app.commandLine.hasSwitch(name)) {
-          bypassArguments.push(`--${name}`)
+      fs.writeFileSync(
+        runtimeReceiptPath,
+        `${JSON.stringify(sanitizeDiagnostic(runtimeReceipt, [gateway.token]), null, 2)}\n`,
+        'utf8',
+      )
+    },
+    capture: failure => collectNativeDiagnostics({
+      app: electronApp, page, observation, outputDir, gateway, failure, secrets: [gateway.token],
+    }),
+    cleanup: async () => {
+      try {
+        await withDiagnosticTimeout(() => electronApp?.close(), 4000, 'Electron close')
+      } finally {
+        try {
+          await withDiagnosticTimeout(() => gateway.close(), 4000, 'gateway close')
+        } finally {
+          fs.rmSync(sandboxRoot, { recursive: true, force: true })
         }
       }
-
-      return {
-        electronVersion: process.versions.electron,
-        appVersion: app.getVersion(),
-        isPackaged: app.isPackaged,
-        platform: process.platform,
-        arch: process.arch,
-        windowVisible: Boolean(visibleWindow),
-        sandbox: preferences.sandbox,
-        contextIsolation: preferences.contextIsolation,
-        nodeIntegration: preferences.nodeIntegration,
-        processArguments: process.argv,
-        bypassArguments,
-      }
-    })
-
-    const argvBypasses = runtime.processArguments.filter(argument =>
-      BYPASS_SWITCHES.some(name => argument === `--${name}` || argument.startsWith(`--${name}=`)),
-    )
-    const runtimeReceipt = {
-      ...runtime,
-      domUseful: dom.childCount > 0 && dom.textLength > 0,
-      errorBoundaryAbsent: dom.errorBoundaryAbsent,
-      bootReady: dom.bootReady,
-      composerEnabled: dom.composerEnabled,
-      overlayAbsent: dom.overlayAbsent,
-      disableGpu: launchOptions.args.includes('--disable-gpu'),
-      bypassArguments: [...new Set([...runtime.bypassArguments, ...argvBypasses])],
-      gatewayMock: gateway.receipt(),
-    }
-
-    expect(runtimeReceipt.electronVersion).toBe(EXPECTED_ELECTRON_VERSION)
-    expect(runtimeReceipt.appVersion).toBe(DESKTOP_PACKAGE.version)
-    expect(runtimeReceipt.isPackaged).toBe(true)
-    expect(runtimeReceipt.platform).toBe(expectedPlatform)
-    expect(runtimeReceipt.arch).toBe(expectedArch)
-    expect(runtimeReceipt.windowVisible).toBe(true)
-    expect(runtimeReceipt.domUseful).toBe(true)
-    expect(runtimeReceipt.errorBoundaryAbsent).toBe(true)
-    expect(runtimeReceipt.bootReady).toBe(true)
-    expect(runtimeReceipt.composerEnabled).toBe(true)
-    expect(runtimeReceipt.overlayAbsent).toBe(true)
-    expect(runtimeReceipt.sandbox).toBe(true)
-    expect(runtimeReceipt.contextIsolation).toBe(true)
-    expect(runtimeReceipt.nodeIntegration).toBe(false)
-    expect(runtimeReceipt.bypassArguments).toEqual([])
-
-    fs.writeFileSync(
-      runtimeReceiptPath,
-      `${JSON.stringify(runtimeReceipt, null, 2)}\n`,
-      'utf8',
-    )
-    await page.screenshot({ path: path.join(outputDir, 'packaged-gui-smoke.png') })
-  } finally {
-    await electronApp?.close().catch(() => undefined)
-    await gateway.close()
-    fs.rmSync(sandboxRoot, { recursive: true, force: true })
-  }
+    },
+  })
 })

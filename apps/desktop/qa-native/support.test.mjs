@@ -18,6 +18,10 @@ import {
 
 
 const SUPPORT_PATH = fileURLToPath(new URL('./support.mjs', import.meta.url))
+const DESKTOP_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
+const DESKTOP_PACKAGE = JSON.parse(
+  fs.readFileSync(path.join(DESKTOP_ROOT, 'package.json'), 'utf8'),
+)
 
 
 function validRuntimeReceipt() {
@@ -75,16 +79,62 @@ test('resolvePackagedLayout covers electron-builder native layouts', () => {
   })
   assert.deepEqual(resolvePackagedLayout({ platform: 'linux', arch: 'x64', releaseRoot: root }), {
     directory: path.join(root, 'linux-unpacked'),
-    binaryPath: path.join(root, 'linux-unpacked', 'hermes'),
+    binaryPath: path.join(root, 'linux-unpacked', DESKTOP_PACKAGE.build.executableName),
   })
   assert.deepEqual(resolvePackagedLayout({ platform: 'linux', arch: 'arm64', releaseRoot: root }), {
     directory: path.join(root, 'linux-arm64-unpacked'),
-    binaryPath: path.join(root, 'linux-arm64-unpacked', 'hermes'),
+    binaryPath: path.join(root, 'linux-arm64-unpacked', DESKTOP_PACKAGE.build.executableName),
   })
   assert.deepEqual(resolvePackagedLayout({ platform: 'win32', arch: 'x64', releaseRoot: root }), {
     directory: path.join(root, 'win-unpacked'),
     binaryPath: path.join(root, 'win-unpacked', 'Hermes.exe'),
   })
+})
+
+test('resolvePackagedLayout derives case-sensitive executable paths from builder configuration', () => {
+  const root = path.resolve('/synthetic/release')
+  const builder = DESKTOP_PACKAGE.build
+
+  assert.equal(
+    resolvePackagedLayout({
+      platform: 'linux',
+      arch: 'x64',
+      releaseRoot: root,
+      productName: builder.productName,
+      executableName: builder.executableName,
+    }).binaryPath,
+    path.join(root, 'linux-unpacked', builder.executableName),
+  )
+
+  const custom = { productName: 'Custom Product', executableName: 'CaseSensitiveBin' }
+  assert.deepEqual(
+    resolvePackagedLayout({ platform: 'linux', arch: 'arm64', releaseRoot: root, ...custom }),
+    {
+      directory: path.join(root, 'linux-arm64-unpacked'),
+      binaryPath: path.join(root, 'linux-arm64-unpacked', 'CaseSensitiveBin'),
+    },
+  )
+  assert.deepEqual(
+    resolvePackagedLayout({ platform: 'win32', arch: 'x64', releaseRoot: root, ...custom }),
+    {
+      directory: path.join(root, 'win-unpacked'),
+      binaryPath: path.join(root, 'win-unpacked', 'CaseSensitiveBin.exe'),
+    },
+  )
+  assert.deepEqual(
+    resolvePackagedLayout({ platform: 'darwin', arch: 'x64', releaseRoot: root, ...custom }),
+    {
+      directory: path.join(root, 'mac'),
+      binaryPath: path.join(
+        root,
+        'mac',
+        'Custom Product.app',
+        'Contents',
+        'MacOS',
+        'CaseSensitiveBin',
+      ),
+    },
+  )
 })
 
 test('resolvePackagedLayout rejects unsupported platform and architecture pairs', () => {
@@ -96,6 +146,20 @@ test('resolvePackagedLayout rejects unsupported platform and architecture pairs'
     () => resolvePackagedLayout({ platform: 'freebsd', arch: 'x64', releaseRoot: '/release' }),
     /unsupported packaged layout: freebsd\/x64/,
   )
+})
+
+test('gateway diagnostics record bounded HTTP outcomes without request credentials', async t => {
+  const gateway = await startGatewayMock()
+  t.after(() => gateway.close())
+  await fetch(`${gateway.url}/api/health?token=not-authorized`)
+  const headers = { 'x-hermes-session-token': gateway.token }
+  await fetch(`${gateway.url}/api/absent`, { headers })
+  await fetch(`${gateway.url}/api/health`, { headers, method: 'POST' })
+  await fetch(`${gateway.url}/api/health`, { headers })
+  const receipt = gateway.receipt()
+  assert.deepEqual(receipt.httpResponses?.map(item => item.status), [401, 404, 405, 200])
+  assert.equal(JSON.stringify(receipt).includes(gateway.token), false)
+  assert.equal(JSON.stringify(receipt).includes('not-authorized'), false)
 })
 
 test('buildLaunchEnv carries only runtime allowlist and isolates all writable homes', () => {
