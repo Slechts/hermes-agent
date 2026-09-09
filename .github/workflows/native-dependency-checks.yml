@@ -1,0 +1,66 @@
+name: Native dependency checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native-dependencies:
+    name: Native proof (${{ matrix.platform }}-${{ matrix.arch }})
+    if: >-
+      github.event_name == 'pull_request' && github.repository == 'Slechts/hermes-agent' &&
+      github.event.pull_request.head.repo.full_name == 'Slechts/hermes-agent' &&
+      github.event.pull_request.head.ref == 'fix/npm-tar-native-graph-20260909'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - runner: windows-2025
+            platform: win32
+            arch: x64
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+    steps:
+      - name: Checkout exact pull request head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Set up Node 22.23.1
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+
+      - name: Pin npm 10.9.8
+        run: npm install --global npm@10.9.8
+
+      - name: Run native dependency proof
+        run: >-
+          node scripts/ci/native-dependency-probe.mjs ci
+          --expected-platform ${{ matrix.platform }}
+          --expected-arch ${{ matrix.arch }}
+          --expected-node 22.23.1
+          --expected-npm 10.9.8
+          --expected-sha ${{ github.event.pull_request.head.sha }}
+          --output "${{ runner.temp }}/native-dependency-proof/receipt.json"
+
+      - name: Upload native dependency proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-dependency-proof-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/native-dependency-proof
+          retention-days: 7
+          if-no-files-found: error
