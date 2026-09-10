@@ -91,10 +91,16 @@ function assertPolicy(workflow: Workflow) {
   assert.equal(job.permissions, undefined)
   assert.equal(job.services, undefined)
   assert.equal(job.container, undefined)
-  assert.equal(job.steps?.length, 5)
+  assert.equal(job.steps?.length, 6)
+
+  const canonical = stepNamed(job, 'Keep canonical checkout bytes')
+  assert.equal(canonical.run, 'git config --global core.autocrlf false')
+  assert.equal(canonical.if, undefined)
+  assert.equal(job.steps?.[0], canonical, 'Canonical configuration must precede checkout')
 
   const checkout = job.steps?.find((step) => step.uses?.startsWith('actions/checkout@'))
   assert.ok(checkout)
+  assert.equal(job.steps?.[1], checkout)
   assert.equal(checkout.uses, 'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd')
   assert.deepEqual(checkout.with, {
     ref: '${{ github.event.pull_request.head.sha }}',
@@ -191,6 +197,46 @@ test('workflow policy rejects missing platform rows and skipped proof', () => {
 test('workflow policy rejects weakened result provenance', () => {
   mutated((workflow) => { stepNamed(workflow.jobs!['native-dependencies']!, 'Run native dependency proof').run = 'node scripts/ci/native-dependency-probe.mjs ci' }, /missing --expected-platform/)
   mutated((workflow) => { workflow.jobs!['native-dependencies']!.steps!.find((step) => step.uses?.startsWith('actions/upload-artifact@'))!.with!.name = 'native-dependency-proof' }, /falsy/)
+})
+
+test('canonical checkout policy rejects conversion, skipping and late configuration', () => {
+  mutated((workflow) => { stepNamed(workflow.jobs!['native-dependencies']!, 'Keep canonical checkout bytes').run = 'git config --global core.autocrlf true' }, /strictly equal/)
+  mutated((workflow) => { stepNamed(workflow.jobs!['native-dependencies']!, 'Keep canonical checkout bytes').if = 'false' }, /undefined/)
+  mutated((workflow) => {
+    const steps = workflow.jobs!['native-dependencies']!.steps!
+    const first = steps.shift()!
+    steps.splice(1, 0, first)
+  }, /must precede checkout/)
+})
+
+test('canonical checkout command preserves source bytes despite inherited CRLF defaults', () => {
+  const command = stepNamed(loadWorkflow().jobs!['native-dependencies']!, 'Keep canonical checkout bytes').run!
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'native-checkout-'))
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: path.join(temporary, 'global.gitconfig'), GIT_CONFIG_NOSYSTEM: '1' }
+  const source = '#!/usr/bin/env node\nexport const canonical = true\n'
+  const fixture = path.join(temporary, 'fixture.mjs')
+
+  function git(args: string[], input?: string) {
+    const run = spawnSync('git', args, { cwd: temporary, env, input, encoding: 'utf8', timeout: 10000 })
+    assert.equal(run.status, 0, run.stdout + run.stderr)
+
+    return run.stdout.trim()
+  }
+
+  try {
+    git(['init', '--quiet'])
+    git(['config', '--global', 'core.autocrlf', 'true'])
+    const blob = git(['hash-object', '-w', '--stdin'], source)
+    git(['update-index', '--add', '--cacheinfo', '100644', blob, 'fixture.mjs'])
+    git(['checkout-index', '--all', '--force'])
+    assert.equal(fs.readFileSync(fixture, 'utf8'), source.replaceAll('\n', '\r\n'))
+    assert.ok(command.startsWith('git '))
+    git(command.split(' ').slice(1))
+    git(['checkout-index', '--all', '--force'])
+    assert.equal(fs.readFileSync(fixture, 'utf8'), source)
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
 })
 
 function runRuntime(expectedPlatform = process.platform) {
