@@ -114,7 +114,43 @@ function walkFiles(directory, suffix) {
   })
 }
 
-async function ptyRoundTrip(pty, cwd, label) {
+// node-pty 1.1.0 does not dispose this worker after a natural ConPTY exit.
+// Never call child.kill() here: only release the connection owned by this PTY
+// and wait for its actual worker exit so PID reuse cannot affect other processes.
+async function disposeOwnedConoutWorker(child, label) {
+  const agent = child?._agent
+  if (!agent) {
+    assert.ok(process.platform !== 'win32', `${label}: node-pty Windows agent internals are unavailable`)
+    return
+  }
+
+  const connection = agent._conoutSocketWorker
+  assert.ok(connection && typeof connection.dispose === 'function',
+    `${label}: node-pty ConoutConnection disposal is unavailable`)
+  const worker = connection._worker
+  assert.ok(worker && typeof worker.once === 'function' && typeof worker.off === 'function',
+    `${label}: node-pty ConoutConnection worker is unavailable`)
+  if (worker.threadId === -1) return
+
+  await new Promise((resolve, reject) => {
+    let timer
+    const finish = (operation, value) => {
+      clearTimeout(timer)
+      worker.off('error', onError)
+      worker.off('exit', onExit)
+      operation(value)
+    }
+    const onError = (error) => finish(reject, error)
+    const onExit = () => finish(resolve)
+    worker.once('error', onError)
+    worker.once('exit', onExit)
+    timer = setTimeout(() => onError(new Error(`${label}: node-pty ConoutConnection worker exit timeout`)), 3_000)
+    try { connection.dispose() } catch (error) { onError(error) }
+  })
+  assert.equal(worker.threadId, -1, `${label}: node-pty ConoutConnection worker is still active`)
+}
+
+export async function ptyRoundTrip(pty, cwd, label, timeoutMs = 10_000) {
   return new Promise((resolve, reject) => {
     const windows = process.platform === 'win32'
     const executable = windows ? process.env.ComSpec || 'cmd.exe' : '/bin/sh'
@@ -123,19 +159,46 @@ async function ptyRoundTrip(pty, cwd, label) {
       ? cleanChildEnv({ HOME: cwd, TEMP: cwd, TMP: cwd })
       : { PATH: '/usr/bin:/bin', HOME: cwd, TMPDIR: cwd, TERM: 'xterm' }
     let output = ''
+    let settled = false
+    let dataSubscription
+    let exitSubscription
     const child = pty.spawn(executable, args, { name: 'xterm', cols: 80, rows: 24, cwd, env })
+    const removeListeners = () => {
+      dataSubscription?.dispose()
+      exitSubscription?.dispose()
+    }
     const timer = setTimeout(() => {
-      child.kill()
-      reject(new Error(`${label}: PTY timeout`))
-    }, 10_000)
-    child.onData((chunk) => { output += chunk })
-    child.onExit(({ exitCode }) => {
+      if (settled) return
+      settled = true
+      removeListeners()
+      const timeoutError = new Error(`${label}: PTY timeout`)
+      try { child.kill() } catch (error) {
+        reject(new AggregateError([timeoutError, error], `${timeoutError.message}; child cleanup failed`))
+        return
+      }
+      reject(timeoutError)
+    }, timeoutMs)
+    dataSubscription = child.onData((chunk) => { output += chunk })
+    exitSubscription = child.onExit(({ exitCode }) => {
+      if (settled) return
+      settled = true
       clearTimeout(timer)
-      try {
-        assert.equal(exitCode, 0)
-        assert.ok(output.replaceAll('\r', '').includes('HERMES_NATIVE_PTY_OK'))
-        resolve({ exitCode, output: output.trim() })
-      } catch (error) { reject(error) }
+      void (async () => {
+        let failure
+        try {
+          assert.equal(exitCode, 0)
+          assert.ok(output.replaceAll('\r', '').includes('HERMES_NATIVE_PTY_OK'))
+        } catch (error) { failure = error }
+        try { await disposeOwnedConoutWorker(child, label) } catch (error) {
+          failure = failure
+            ? new AggregateError([failure, error],
+                `${String(failure?.message ?? failure)}; resource cleanup failed: ${String(error?.message ?? error)}`)
+            : error
+        }
+        removeListeners()
+        if (failure) reject(failure)
+        else resolve({ exitCode, output: output.trim() })
+      })()
     })
   })
 }
