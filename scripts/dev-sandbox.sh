@@ -480,10 +480,18 @@ INTERACTIVE=false
 if [ -t 0 ] && [ -t 1 ]; then
   INTERACTIVE=true
 fi
-NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"
-if [ -z "$NODE_DIR" ] && command -v node >/dev/null; then
-  NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"
-fi
+configure_node_dir() {
+  NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"
+  if [ -z "$NODE_DIR" ] && [ "$INSTALL_SHORTCUT" = true ]; then
+    # The installer may replace the startup runtime before npm builds native
+    # addons. Point node-gyp at that managed prefix: it will contain matching
+    # include/node headers by the time npm runs.
+    NODE_DIR="$SANDBOX_HOME/.hermes/node"
+  elif [ -z "$NODE_DIR" ] && command -v node >/dev/null; then
+    NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"
+  fi
+}
+configure_node_dir
 WAYLAND_SOCKET=""
 if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
   && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then

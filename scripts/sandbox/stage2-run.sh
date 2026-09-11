@@ -47,10 +47,6 @@ if [ "$home_parent" != / ]; then
 fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
-node_env=()
-if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
-fi
 electron_env=()
 if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
   electron_env+=(
@@ -89,6 +85,26 @@ if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
 else
   USE_HOST_RUNTIME=true
 fi
+
+# Only pass node-gyp a header prefix that remains visible in the sandbox. An
+# install shortcut targets the managed Node prefix under sandbox HOME; the
+# installer populates matching include/node headers there before npm runs. A
+# Nix store prefix is immutable and /nix is mounted read-only. Host prefixes
+# such as /usr/local are hidden by sandbox mounts and must not leak through.
+configure_node_env() {
+  node_env=()
+  case "${DEV_SANDBOX_NODE_DIR:-}" in
+    "$DEV_SANDBOX_HOME"/*)
+      node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+      ;;
+    /nix/*)
+      if [ "$USE_HOST_RUNTIME" = false ]; then
+        node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+      fi
+      ;;
+  esac
+}
+configure_node_env
 
 runtime_mounts=()
 shim_mounts=()
