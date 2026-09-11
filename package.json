@@ -11,7 +11,7 @@
     "tests-js"
   ],
   "scripts": {
-    "postinstall": "echo '\u2705 Browser tools ready. Run: python run_agent.py --help'",
+    "postinstall": "node scripts/fix-node-pty-permissions.mjs && echo '\u2705 Browser tools ready. Run: python run_agent.py --help'",
     "install:root": "npm install --workspaces=false",
     "install:web": "npm install --workspace web",
     "install:tui": "npm install --workspace ui-tui",
@@ -59,7 +59,11 @@
     "js-yaml@^4": "4.3.1",
     "undici@^6": "6.28.0",
     "undici@^7": "7.29.0",
-    "postcss": "8.5.23"
+    "postcss": "8.5.23",
+    "tar": "7.5.22",
+    "@rolldown/binding-wasm32-wasi@1.2.1": {
+      "@napi-rs/wasm-runtime": "1.2.2"
+    }
   },
   "engines": {
     "node": ">=22.22.0",
