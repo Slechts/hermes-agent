@@ -3,7 +3,7 @@ from pathlib import Path
 
 WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "install-e2e.yml"
 UPSTREAM_TAG_FETCH = (
-    "git fetch --force --no-tags https://github.com/NousResearch/hermes-agent.git "
+    "git fetch --filter=blob:none --force --no-tags https://github.com/NousResearch/hermes-agent.git "
     "'+refs/tags/v*:refs/tags/v*'"
 )
 PICK_RELEASES = 'tags="$(scripts/sandbox/pick-release-tags.sh'
