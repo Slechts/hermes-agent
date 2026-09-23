@@ -134,6 +134,54 @@ def test_workflow_binds_selection_to_run_sha_and_complete_history() -> None:
     assert '--count "$TAG_COUNT"' in picker["run"]
 
 
+def test_workflow_keeps_sparse_checkout_and_filters_upstream_fetch() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/install-e2e.yml").read_text())
+    job = workflow["jobs"]["pick-releases"]
+    checkout = next(step for step in job["steps"] if "actions/checkout@" in step.get("uses", ""))
+    # checkout@v6 explicitly makes filter override sparse-checkout. Supplying
+    # both hydrates the whole tree, despite the apparently narrow path.
+    assert "filter" not in checkout["with"]
+    assert checkout["with"]["sparse-checkout"] == "scripts/sandbox/pick-release-tags.sh"
+    assert checkout["with"]["sparse-checkout-cone-mode"] is False
+    upstream = next(step for step in job["steps"] if step.get("name") == "Fetch canonical upstream release tags")
+    assert "git fetch --filter=blob:none --force --no-tags" in upstream["run"]
+    assert "https://github.com/NousResearch/hermes-agent.git" in upstream["run"]
+    assert "'+refs/tags/v*:refs/tags/v*'" in upstream["run"]
+    assert "--depth" not in upstream["run"]
+    assert job["timeout-minutes"] == 5
+
+
+def test_upstream_metadata_is_lazy_fetched_when_origin_fork_lacks_it(history, tmp_path) -> None:
+    upstream, _ = history
+    git(upstream, "config", "uploadpack.allowFilter", "true")
+    fork = tmp_path / "fork"
+    fork.mkdir()
+    git(fork, "init", "-q")
+    target = commit(fork, "independent fork target", "0.20.0", "2026.8.26")
+    git(fork, "config", "uploadpack.allowFilter", "true")
+    oldest_blob = git(upstream, "rev-parse", "v2026.3.12:hermes_cli/__init__.py")
+    absent = subprocess.run(["git", "-C", str(fork), "cat-file", "-e", oldest_blob], capture_output=True)
+    assert absent.returncode != 0, "fixture origin must not contain upstream metadata"
+    consumer = tmp_path / "consumer"
+    subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout", fork.as_uri(), str(consumer)],
+                   check=True, capture_output=True)
+    workflow = yaml.safe_load((ROOT / ".github/workflows/install-e2e.yml").read_text())
+    fetch_step = next(step for step in workflow["jobs"]["pick-releases"]["steps"]
+                      if step.get("name") == "Fetch canonical upstream release tags")
+    command = fetch_step["run"].replace("https://github.com/NousResearch/hermes-agent.git", upstream.as_uri())
+    fetched = subprocess.run(["bash", "-euo", "pipefail", "-c", command], cwd=consumer,
+                             capture_output=True, text=True, timeout=20)
+    assert fetched.returncode == 0, fetched.stderr
+    # Prove this exercises lazy fetching, not an eager server that ignored the
+    # filter: the upstream-only blob must still be absent from local packs.
+    pack_dump = "\n".join(git(consumer, "verify-pack", "-v", str(index))
+                          for index in (consumer / ".git/objects/pack").glob("*.idx"))
+    assert not any(line.split()[0] == oldest_blob for line in pack_dump.splitlines() if line)
+    result = select(consumer, "--target", target, "--count", "5")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["v2026.3.12", "v2026.8.3", "v2026.8.26"]
+
+
 def test_older_backport_remains_eligible_without_git_ancestry(history) -> None:
     repo, target = history
     git(repo, "checkout", "--detach", "v2026.3.12")
