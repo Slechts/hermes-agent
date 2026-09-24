@@ -817,6 +817,30 @@ npm_supports_npmrc() {
     return 0
 }
 
+# Automatic sandbox headers follow the executing Node, never the host/future Node.
+# Keep this helper identical to scripts/sandbox/stage2-run.sh (contract tested).
+configure_sandbox_node_headers() {
+    [ "${DEV_SANDBOX_AUTO_NODE_HEADERS:-}" = 1 ] || return 0
+    local node_dir
+    node_dir="$(node -e '
+        const fs = require("fs"), p = require("path");
+        const root = p.dirname(p.dirname(process.execPath));
+        try {
+            const header = fs.readFileSync(p.join(root, "include/node/node_version.h"), "utf8");
+            const version = ["MAJOR", "MINOR", "PATCH"].map(k =>
+                header.match(new RegExp("^#define NODE_" + k + "_VERSION\\s+(\\d+)", "m"))[1]
+            ).join(".");
+            if (version === process.versions.node && fs.existsSync(p.join(root, "include/node/common.gypi")))
+                process.stdout.write(root);
+        } catch (_) { /* No matching installed headers: let node-gyp resolve them. */ }
+    ' 2>/dev/null)" || node_dir=""
+    if [ -n "$node_dir" ]; then
+        export npm_config_nodedir="$node_dir"
+    else
+        unset npm_config_nodedir
+    fi
+}
+
 check_node() {
     log_info "Checking Node.js (for browser tools)..."
 
@@ -833,6 +857,7 @@ check_node() {
         if ! command -v npm &> /dev/null || npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
             log_success "Node.js $(node --version) found"
             HAS_NODE=true
+            configure_sandbox_node_headers
             return 0
         fi
         log_warn "npm $(npm --version) cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
@@ -846,6 +871,7 @@ check_node() {
         export PATH="$HERMES_HOME/node/bin:$PATH"
         log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
         HAS_NODE=true
+        configure_sandbox_node_headers
         return 0
     fi
 
@@ -972,6 +998,7 @@ install_node() {
     installed_ver=$("$HERMES_HOME/node/bin/node" --version 2>/dev/null)
     log_success "Node.js $installed_ver installed to ~/.hermes/node/"
     HAS_NODE=true
+    configure_sandbox_node_headers
 }
 
 check_network_prerequisites() {
@@ -2303,7 +2330,9 @@ install_node_deps() {
         cd "$INSTALL_DIR"
         # Time-boxed: a stalled registry fetch would otherwise hang here with no
         # progress (same #39219 stall class as the desktop build below).
-        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install; then
+        # Install only the root/browser dependencies, not every workspace
+        # (notably Desktop). TUI is installed separately from its own directory.
+        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --workspaces=false; then
             log_success "Node.js dependencies installed"
         else
             log_warn "npm install failed or timed out (browser tools may not work)"

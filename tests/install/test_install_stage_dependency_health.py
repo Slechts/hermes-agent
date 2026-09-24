@@ -1,6 +1,7 @@
 """Exercise the real installer stage entry points, not source-text patterns."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -115,6 +116,74 @@ def test_node_stages_report_actual_dependency_outcome(tmp_path: Path, npm_exit: 
     saved = Path(env["LOG_DIR"])
     assert (saved / "sandbox-install/npm/debug.log").read_text() == "fixture npm detail\n"
     assert "dependency diagnostic" in (saved / "install.log").read_text()
+
+
+@pytest.mark.parametrize("monorepo", [True, False])
+def test_real_npm_installs_browser_and_tui_without_desktop(tmp_path: Path, monorepo: bool) -> None:
+    """Execute real npm lifecycle scripts; Desktop must never be selected."""
+    assert shutil.which("npm"), "real npm required for workspace regression"
+    project, env = environment(tmp_path)
+    events = tmp_path / "lifecycle.jsonl"
+    env.update(HERMES_FIXTURE_EVENTS=str(events), npm_config_offline="true",
+               npm_config_audit="false", npm_config_fund="false",
+               npm_config_registry="http://127.0.0.1:9",
+               npm_config_foreground_scripts="true")
+
+    def package(folder: Path, name: str, fail: bool = False) -> dict:
+        folder.mkdir(parents=True, exist_ok=True)
+        script = ("require('fs').appendFileSync(process.env.HERMES_FIXTURE_EVENTS, "
+                  + json.dumps(name + "\n") + ");"
+                  + ("process.exit(42);" if fail else ""))
+        manifest = {"name": name, "version": "1.0.0", "private": True,
+                    "scripts": {"postinstall": "node -e '" + script.replace("'", '"') + "'"}}
+        (folder / "package.json").write_text(json.dumps(manifest))
+        return manifest
+
+    root = package(project, "fixture-root")
+    package(project / "browser-tools", "fixture-browser")
+    package(project / "ui-tui", "fixture-tui")
+    package(project / "apps/desktop", "fixture-desktop", fail=True)
+    root["dependencies"] = {"fixture-browser": "file:./browser-tools"}
+    if monorepo:
+        root["workspaces"] = ["ui-tui", "apps/*"]
+    (project / "package.json").write_text(json.dumps(root))
+    result = run_stage("node-deps", env)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    selected = events.read_text().splitlines()
+    assert "fixture-desktop" not in selected, (selected, output)
+    assert {"fixture-root", "fixture-browser", "fixture-tui"} <= set(selected), (selected, output)
+    assert (project / "node_modules/fixture-browser/package.json").is_file()
+    assert "Node.js dependencies installed" in output, output
+    assert "TUI dependencies installed" in output, output
+    assert "npm install failed or timed out" not in output, output
+
+
+@pytest.mark.parametrize("automatic", [True, False])
+@pytest.mark.parametrize("stale_exists", [True, False])
+def test_node_stage_uses_executing_runtime_headers(tmp_path: Path, automatic: bool, stale_exists: bool) -> None:
+    project, env = environment(tmp_path)
+    (project / "package.json").write_text('{}\n')
+    actual = Path(subprocess.check_output(['node', '-p', 'process.execPath'], text=True).strip()).parent.parent
+    assert (actual / 'include/node/common.gypi').is_file(), 'runtime headers required for this regression'
+    stale = Path(env['HERMES_HOME']) / 'node'
+    if stale_exists:
+        (stale / 'include/node').mkdir(parents=True)
+        (stale / 'include/node/common.gypi').write_text('{}\n')
+        (stale / 'include/node/node_version.h').write_text('#define NODE_MAJOR_VERSION 99\n')
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    capture = tmp_path / 'npm-headers'
+    npm = tools / 'npm'
+    npm.write_text('#!/bin/sh\nif [ "$1" = --version ]; then printf "10.9.9\\n"; exit 0; fi\n'
+                   'printf "%s" "${npm_config_nodedir:-}" > "$HEADER_CAPTURE"\n')
+    npm.chmod(0o755)
+    env.update(PATH=str(tools) + os.pathsep + env['PATH'], HEADER_CAPTURE=str(capture),
+               npm_config_nodedir=str(stale), DEV_SANDBOX_AUTO_NODE_HEADERS='1' if automatic else '0')
+    result = run_stage('node-deps', env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'Node.js v' in result.stdout and 'found' in result.stdout
+    assert capture.read_text() == str(actual if automatic else stale)
 
 
 def test_locked_stage_keeps_project_overrides_sources_and_constraints(tmp_path: Path) -> None:
