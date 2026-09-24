@@ -1578,7 +1578,22 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        # UV_NO_CONFIG must keep ignoring unrelated user/ancestor configuration,
+        # but it also hides this project's resolver policy (e.g. exclude-newer),
+        # making a valid lock appear stale. Explicit config bypasses discovery,
+        # not lock/hash verification. Do not regenerate the lock or use --frozen.
+        local uv_project_config sync_status=0
+        uv_project_config="$(mktemp)" || { log_error "Cannot create uv config"; exit 1; }
+        if ! "$PYTHON_PATH" "$INSTALL_DIR/scripts/uv_project_config.py" \
+            "$INSTALL_DIR/pyproject.toml" > "$uv_project_config"; then
+            rm -f -- "$uv_project_config"
+            log_error "Cannot read the project's uv configuration"
+            exit 1
+        fi
+        UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" "$UV_CMD" sync \
+            --config-file "$uv_project_config" --extra all --locked || sync_status=$?
+        rm -f -- "$uv_project_config"
+        if [ "$sync_status" -eq 0 ]; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -2288,10 +2303,11 @@ install_node_deps() {
         cd "$INSTALL_DIR"
         # Time-boxed: a stalled registry fetch would otherwise hang here with no
         # progress (same #39219 stall class as the desktop build below).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install; then
+            log_success "Node.js dependencies installed"
+        else
             log_warn "npm install failed or timed out (browser tools may not work)"
-        }
-        log_success "Node.js dependencies installed"
+        fi
 
         # Install Playwright browser + system dependencies.
         # Playwright's --with-deps only supports apt-based systems natively.
@@ -2390,10 +2406,11 @@ install_node_deps() {
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install; then
+            log_success "TUI dependencies installed"
+        else
             log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
-        }
-        log_success "TUI dependencies installed"
+        fi
     fi
 
     # Keep the checkout clean so `hermes update` doesn't autostash every run.

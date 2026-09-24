@@ -159,7 +159,7 @@ rm -rf -- "$SANDBOX_ROOT"
 # and argparse prints every option it accepts.
 update_supports() {
   local flag="$1"
-  in_sandbox "hermes update --help 2>&1" | grep -qF -- "$flag"
+  in_sandbox "hermes update --help 2>&1" | grep -F -- "$flag" > /dev/null
 }
 
 # Does the installer at REF accept FLAG? Read it out of that ref's own
@@ -179,7 +179,9 @@ installer_supports() {
     git fetch -q --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
     script="$(git show FETCH_HEAD:scripts/install.sh 2>/dev/null)" || return 1
   }
-  printf '%s' "$script" | grep -qF -- "$flag"
+  # Drain the producer: grep -q exits early, so a large installer triggers
+  # SIGPIPE in printf and pipefail turns a present flag into a false negative.
+  printf '%s' "$script" | grep -F -- "$flag" > /dev/null
 }
 
 # Run the real install one-liner inside the sandbox. `ref` non-empty installs
@@ -215,18 +217,26 @@ install_in_sandbox() {
   # tee's status and a failed install looks like a pass.
   local status=0
   "${SANDBOX[@]}" "${args[@]}" 2>&1 | tee "$log" || status=$?
+  # Optional dependency failures can still return zero and print Complete.
+  # Capture diagnostics on success too, before any next sandbox invocation.
+  collect_sandbox_logs "$tag"
 
   if [ "$status" -ne 0 ]; then
-    collect_sandbox_logs "$tag"
     fail "$what failed (exit $status)"
   fi
   grep -q 'Installation Complete' "$log" \
-    || { collect_sandbox_logs "$tag"; \
-         fail "$what did not report a completed install"; }
+    || fail "$what did not report a completed install"
   ok "$what completed (log: $log)"
 }
 
 in_sandbox() { "${SANDBOX[@]}" --persistent bash -lc "$1"; }
+
+run_in_sandbox_logged() {
+  local command="$1" tag="$2" status=0
+  in_sandbox "$command" 2>&1 | tee "$LOG_DIR/$tag.log" || status=$?
+  collect_sandbox_logs "$tag"
+  return "$status"
+}
 
 # fake main's SHA is read fresh whenever it is needed, never cached across a
 # sandbox invocation: each invocation re-derives it from the worktree.
@@ -249,6 +259,16 @@ require_hermes_works() {
     || { printf '%s\n' "$out" >&2; fail "hermes --version failed $when"; }
   printf '%s\n' "$out" | sed 's/^/    /'
   ok "hermes runs $when"
+}
+
+# A correct HEAD and working CLI do not prove that autostash reapplied cleanly.
+# Fail rather than discard user changes or silently resolve a lockfile conflict.
+require_no_unmerged_paths() {
+  local what="$1" unmerged
+  unmerged="$(in_sandbox "cd $INSTALL_DIR && git diff --name-only --diff-filter=U")" \
+    || fail "could not inspect unmerged paths after $what"
+  [ -z "$unmerged" ] || fail "$what left unresolved merge conflicts: $unmerged"
+  ok "$what has no unresolved merge conflicts"
 }
 
 # ── install the earlier Hermes ─────────────────────────────────────────────
@@ -275,12 +295,13 @@ case "$ROUTE" in
     else
       update_cmd="hermes update </dev/null"
     fi
-    if ! in_sandbox "cd $INSTALL_DIR && $update_cmd"; then
-      collect_sandbox_logs update
-      fail "hermes update failed ($update_cmd)"
-    fi
+    update_status=0
+    run_in_sandbox_logged "cd $INSTALL_DIR && $update_cmd" update || update_status=$?
+    [ "$update_status" -eq 0 ] \
+      || fail "hermes update failed (exit $update_status; $update_cmd)"
     require_landed_on_target 'hermes update'
     require_hermes_works 'after hermes update'
+    require_no_unmerged_paths 'hermes update'
     ;;
   installer)
     step 'ROUTE: installer re-run over the existing checkout'
@@ -289,6 +310,7 @@ case "$ROUTE" in
     install_in_sandbox 'installer re-run' '' reinstall
     require_landed_on_target 'installer re-run'
     require_hermes_works 'after installer re-run'
+    require_no_unmerged_paths 'installer re-run'
     ;;
 esac
 
