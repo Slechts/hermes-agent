@@ -203,7 +203,7 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
         assert result is False
         out = capsys.readouterr().out
         assert "Skipped restoring local changes" in out
-        assert "git stash apply stash@{0}" in out
+        assert "git stash apply --index stash@{0}" in out
 
     def test_stash_restore_eof_error_still_falls_through_to_skip(self, tmp_path):
         """Sanity: this fix must not regress the pre-existing EOFError case,

@@ -1322,12 +1322,12 @@ def _restore_stashed_changes(
         if response not in {"", "y", "yes"}:
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
-            print(f"Restore manually with: git stash apply {stash_ref}")
+            print(f"Restore manually with: git stash apply --index {stash_ref}")
             return False
 
     print("→ Restoring local changes...")
     restore = subprocess.run(
-        git_cmd + ["stash", "apply", stash_ref],
+        git_cmd + ["stash", "apply", "--index", stash_ref],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
@@ -1340,22 +1340,30 @@ def _restore_stashed_changes(
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
+    if unmerged.returncode != 0:
+        print("⚠ Could not verify the index for conflicts; restoration is unverified.")
+        print("Your stashed changes are preserved for manual recovery.")
+        print(f"  Stash ref: {stash_ref}")
+        print("  Review `git status` before attempting recovery; no cleanup was attempted.")
+        return False
     has_conflicts = bool(unmerged.stdout.strip())
 
     if restore.returncode != 0 and not has_conflicts and (
         _stash_apply_failed_only_on_existing_untracked(restore.stderr)
     ):
-        # Permission-denied autostash tail end: the tracked changes applied
-        # cleanly; the only "failure" is untracked files that never left the
-        # working tree (git could not delete them at stash time, so it now
-        # refuses to overwrite them). Their content was never touched —
-        # nothing is lost. Treat as restored.
+        # Existing untracked files may have changed since the stash was made.
+        # Even --index can leave a partially restored index on this error path.
+        # Keep the saved versions reachable; do not reset the applied changes.
         print(
             "  ⚠ Some stashed untracked files already exist in the working "
-            "tree and were kept as-is."
+            "tree and were kept as-is. Restoration is incomplete."
         )
+        print("Your stashed changes are preserved for manual recovery.")
+        print(f"  Stash ref: {stash_ref}")
+        print("  Review `git status`, `git diff` and `git diff --cached` before retrying.")
+        return False
     elif restore.returncode != 0 or has_conflicts:
-        print("✗ Update pulled new code, but restoring local changes hit conflicts.")
+        print("✗ Restoring local changes failed or hit conflicts.")
         if restore.stdout.strip():
             print(restore.stdout.strip())
         if restore.stderr.strip():
@@ -1368,19 +1376,27 @@ def _restore_stashed_changes(
             for f in conflicted_files.splitlines():
                 print(f"  • {f}")
 
-        print("\nYour stashed changes are preserved — nothing is lost.")
+        print("\nYour stashed changes are preserved for manual recovery.")
         print(f"  Stash ref: {stash_ref}")
 
-        # Always reset to clean state — leaving conflict markers in source
+        # Reset tracked files/index — leaving conflict markers in source
         # files makes hermes completely unrunnable (SyntaxError on import).
         # The user's changes are safe in the stash for manual recovery.
-        subprocess.run(
+        reset = subprocess.run(
             git_cmd + ["reset", "--hard", "HEAD"],
             cwd=cwd,
             capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
         )
-        print("Working tree reset to clean state.")
-        print(f"Restore your changes later with: git stash apply {stash_ref}")
+        if reset.returncode == 0:
+            print("Tracked files and index reset to HEAD; untracked files may remain.")
+        else:
+            print("⚠ Could not reset tracked files and index; conflicts may remain.")
+            if reset.stderr.strip():
+                print(reset.stderr.strip())
+        print("Review `git status` before attempting recovery.")
+        print(f"Manual recovery command: git stash apply --index {stash_ref}")
+        print("Reapplying on the updated code may conflict again; keep the stash until verified.")
         # Don't sys.exit — the code update itself succeeded, only the stash
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.

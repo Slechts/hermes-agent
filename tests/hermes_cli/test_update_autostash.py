@@ -293,7 +293,8 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
 def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
     """Behavioral E2E of the whole permission-denied class with real git:
     root-owned-style undeletable untracked dir → stash succeeds, update-style
-    reset works, restore round-trips, nothing lost. (#70127 follow-up)"""
+    reset works, tracked changes return, stash remains for an incomplete
+    untracked restore. (#70127 follow-up)"""
     import os
     import shutil
     import subprocess
@@ -332,7 +333,8 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         restored = hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
-        assert restored is True
+        assert restored is False
+        assert stash_ref in git("stash", "list", "--format=%H").stdout.splitlines()
         assert (tmp_path / "tracked.txt").read_text() == "v2 local change\n"
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
