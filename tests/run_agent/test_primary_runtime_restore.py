@@ -31,13 +31,15 @@ def _make_tool_defs(*names: str) -> list:
 
 
 def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm.example.com/v1"):
-    """Create a minimal AIAgent with optional fallback config."""
+    """Create a transport fixture, independent of live model/context metadata."""
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
+        patch("agent.context_compressor.get_model_context_length", return_value=131_072),
     ):
         agent = AIAgent(
+            model="test-primary-model",
             api_key="test-key-12345678",
             base_url=base_url,
             provider=provider,
@@ -48,6 +50,21 @@ def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm
         )
         agent.client = MagicMock()
         return agent
+
+
+def test_transport_fixture_does_not_query_external_context_metadata():
+    """Transport setup must not depend on a provider's changing model catalog."""
+    with patch(
+        "agent.model_metadata._resolve_nous_context_length",
+        return_value=(36_864, "portal"),
+    ) as resolve_context:
+        agent = _make_agent(
+            provider="nous",
+            base_url="https://inference-api.nousresearch.com/v1",
+        )
+        assert agent.model == "test-primary-model"
+        assert agent.context_compressor.context_length == 131_072
+        resolve_context.assert_not_called()
 
 
 def _mock_resolve(base_url="https://openrouter.ai/api/v1", api_key="fallback-key-1234"):

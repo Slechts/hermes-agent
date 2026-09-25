@@ -330,13 +330,27 @@ def test_missing_evidence_is_not_a_pass(tmp_path):
     assert result.returncode != 0
 
 
-def test_candidate_refuses_host_execution(tmp_path):
+def test_candidate_refuses_host_execution(tmp_path, monkeypatch):
+    import pytest
+
     assert SHELL.is_file(), "candidate E2E entry point must exist"
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__)), "--candidate-run", "update", "clean"],
-        cwd=tmp_path, capture_output=True, text=True, timeout=30,
-    )
-    assert result.returncode == 1 and "dev sandbox" in result.stderr
+    outside = tmp_path / "outside-sandbox"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    def unexpected_operation(*args, **kwargs):
+        pytest.fail("candidate work started before the real sandbox guard refused")
+
+    # Exercise the real entry boundary without spawning an updater-shaped
+    # command. Keep require_dev_sandbox and the canonical live guard intact.
+    for name in ("code_identity", "git", "exercise_candidate", "installed_operation"):
+        monkeypatch.setitem(globals(), name, unexpected_operation)
+    for route in ("update", "installer"):
+        for case in ("clean", "conflict"):
+            monkeypatch.setattr(sys, "argv", [__file__, "--candidate-run", route, case])
+            with pytest.raises(ValueError, match="candidate operation requires the dev sandbox"):
+                main()
+    assert list(outside.iterdir()) == []
 
 
 def _probe_fixture(tmp_path):
