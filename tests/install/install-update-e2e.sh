@@ -9,6 +9,9 @@
 # canonical install.sh URL, and a git-upload-pack shim standing in for
 # github.com -- so `install.sh` really installs uv, a managed Python, Node and
 # the venv, cloning "github.com" over the ssh-first path a user hits.
+# This is historical upgrade compatibility, NOT proof that the candidate's
+# autostash implementation ran: the old CLI may already be loaded in memory.
+# autostash-candidate-e2e.sh provides the independent candidate-executed proof.
 #
 # One route per run, on a sandbox built from scratch, because the routes are only
 # meaningful from a pristine install. Sharing one install across routes -- or
@@ -221,6 +224,9 @@ install_in_sandbox() {
   # Capture diagnostics on success too, before any next sandbox invocation.
   collect_sandbox_logs "$tag"
 
+  if [ "$tag" = reinstall ]; then
+    capture_update_evidence after-installer
+  fi
   if [ "$status" -ne 0 ]; then
     fail "$what failed (exit $status)"
   fi
@@ -230,6 +236,15 @@ install_in_sandbox() {
 }
 
 in_sandbox() { "${SANDBOX[@]}" --persistent bash -lc "$1"; }
+
+# Preserve source identities, index/worktree patches and referenced stash
+# objects even when an old updater returns zero after an incomplete restore.
+# Bundles record their base prerequisite; recovery is not automatic merging.
+capture_update_evidence() {
+  local tag="$1"
+  in_sandbox "python3 /work/repo/tests/install/test_autostash_candidate_e2e.py --history $INSTALL_DIR /work/logs/autostash-$tag"
+  collect_sandbox_logs "$tag"
+}
 
 run_in_sandbox_logged() {
   local command="$1" tag="$2" status=0
@@ -282,6 +297,7 @@ TARGET="$(sandbox_target)"
   || fail "install landed on the update target ($BASE); base and target must differ"
 ok "installed ${BASE:0:12}; update target is ${TARGET:0:12}"
 require_hermes_works 'after install'
+capture_update_evidence before-update
 
 # ── apply exactly one update route ─────────────────────────────────────────
 case "$ROUTE" in
@@ -297,6 +313,7 @@ case "$ROUTE" in
     fi
     update_status=0
     run_in_sandbox_logged "cd $INSTALL_DIR && $update_cmd" update || update_status=$?
+    capture_update_evidence after-update
     [ "$update_status" -eq 0 ] \
       || fail "hermes update failed (exit $update_status; $update_cmd)"
     require_landed_on_target 'hermes update'

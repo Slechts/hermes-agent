@@ -34,6 +34,11 @@ on:
         required: false
         type: string
         default: ubuntu-latest
+      candidate-case:
+        description: 'Independent candidate autostash proof: clean or conflict; empty runs historical upgrade.'
+        required: false
+        type: string
+        default: ''
       timeout-minutes:
         description: 'Job timeout. A cold run installs real toolchains twice.'
         required: false
@@ -45,7 +50,7 @@ permissions:
 
 jobs:
   e2e:
-    name: ${{ inputs.route }} from ${{ inputs.install-ref }}
+    name: ${{ inputs.route }} / ${{ inputs.candidate-case || inputs.install-ref }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
@@ -82,6 +87,7 @@ jobs:
           grep "^$(id -un):" /etc/subuid /etc/subgid || echo "  (none — sandbox will say so)"
 
       - name: Run install + update E2E
+        if: inputs.candidate-case == ''
         run: |
           set -euo pipefail
           tests/install/install-update-e2e.sh \
@@ -95,6 +101,16 @@ jobs:
           # update target mid-run.
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
 
+      - name: Run candidate autostash proof
+        if: inputs.candidate-case != ''
+        env:
+          CANDIDATE_ROUTE: ${{ inputs.route }}
+          CANDIDATE_CASE: ${{ inputs.candidate-case }}
+          HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+        run: |
+          set -euo pipefail
+          bash tests/install/autostash-candidate-e2e.sh --route "$CANDIDATE_ROUTE" --case "$CANDIDATE_CASE"
+
       # Artifact names cannot contain '/', and install-ref may be a full ref
       # like refs/heads/main. GitHub Actions expressions have no string-replace
       # function, so build the safe name here. Runs even on failure -- that is
@@ -106,7 +122,7 @@ jobs:
           set -euo pipefail
           safe_ref='${{ inputs.install-ref }}'
           safe_ref="${safe_ref//\//-}"
-          echo "name=install-e2e-${{ inputs.route }}-${safe_ref}" >> "$GITHUB_OUTPUT"
+          echo "name=install-e2e-${{ inputs.route }}-${safe_ref}-${{ inputs.candidate-case || 'historical' }}" >> "$GITHUB_OUTPUT"
 
       # The installer's own transcripts say far more than the assertion that
       # tripped when a real install breaks.
