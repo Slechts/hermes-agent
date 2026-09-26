@@ -151,12 +151,16 @@ def test_workflow_keeps_sparse_checkout_and_filters_upstream_fetch() -> None:
     assert job["timeout-minutes"] == 5
 
 
-def test_upstream_metadata_is_lazy_fetched_when_origin_fork_lacks_it(history, tmp_path) -> None:
+@pytest.mark.parametrize("mixed_promisors", [False, True])
+def test_upstream_metadata_is_lazy_fetched_when_origin_fork_lacks_it(history, tmp_path, mixed_promisors) -> None:
     upstream, _ = history
     git(upstream, "config", "uploadpack.allowFilter", "true")
     fork = tmp_path / "fork"
     fork.mkdir()
     git(fork, "init", "-q")
+    if mixed_promisors:
+        commit(fork, "fork-only release", "0.18.0", "2026.8.25")
+        git(fork, "tag", "v2026.8.25")
     target = commit(fork, "independent fork target", "0.20.0", "2026.8.26")
     git(fork, "config", "uploadpack.allowFilter", "true")
     oldest_blob = git(upstream, "rev-parse", "v2026.3.12:hermes_cli/__init__.py")
@@ -179,7 +183,60 @@ def test_upstream_metadata_is_lazy_fetched_when_origin_fork_lacks_it(history, tm
     assert not any(line.split()[0] == oldest_blob for line in pack_dump.splitlines() if line)
     result = select(consumer, "--target", target, "--count", "5")
     assert result.returncode == 0, result.stderr
+    expected = ["v2026.3.12", "v2026.8.3", "v2026.8.26"]
+    if mixed_promisors:
+        expected.insert(2, "v2026.8.25")
+        assert "bulk fetch incomplete" in result.stderr
+    assert json.loads(result.stdout) == expected
+
+
+def test_cold_partial_clone_batches_metadata_without_changing_refs(history, tmp_path, monkeypatch) -> None:
+    origin, target = history
+    (origin / "unrelated.txt").write_text("must not hydrate this tracked blob\n")
+    git(origin, "add", "unrelated.txt")
+    commit(origin, "unrelated content", "0.20.0", "2026.8.26")
+    unrelated = git(origin, "rev-parse", "HEAD:unrelated.txt")
+    git(origin, "config", "uploadpack.allowFilter", "true")
+    consumer = tmp_path / "cold-consumer"
+    subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout",
+                    origin.as_uri(), str(consumer)], check=True, capture_output=True)
+    metadata = {git(origin, "rev-parse", f"{ref}:hermes_cli/__init__.py")
+                for ref in (target, "v2026.3.12", "v2026.8.3", "v2026.8.31")}
+    present = set(git(consumer, "cat-file", "--batch-all-objects",
+                      "--batch-check=%(objectname)").splitlines())
+    assert metadata.isdisjoint(present), "fixture must start with cold metadata"
+    assert unrelated not in present
+    before = git(consumer, "for-each-ref"), git(consumer, "rev-parse", "HEAD")
+    config = (consumer / ".git/config").read_bytes()
+    fetch_head = consumer / ".git/FETCH_HEAD"
+    fetch_head.write_text("preserve previous fetch receipt\n")
+    trace = tmp_path / "trace.jsonl"
+    monkeypatch.setenv("GIT_TRACE2_EVENT", str(trace))
+    result = select(consumer, "--target", target, "--count", "5")
+    assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == ["v2026.3.12", "v2026.8.3", "v2026.8.26"]
+    assert "Skipping v2026.8.31" in result.stderr
+    assert (git(consumer, "for-each-ref"), git(consumer, "rev-parse", "HEAD")) == before
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    fetches = [event for event in events
+               if event.get("event") == "start" and "fetch" in event.get("argv", [])]
+    # At most one target lookup plus one bulk release-metadata transfer, not
+    # a network round trip for every tag. Exercise real Git, not mocked I/O.
+    assert len(fetches) <= 2, [event["argv"] for event in fetches]
+    present = set(git(consumer, "cat-file", "--batch-all-objects",
+                      "--batch-check=%(objectname)").splitlines())
+    assert metadata <= present
+    assert unrelated not in present
+    assert (consumer / ".git/config").read_bytes() == config
+    assert fetch_head.read_text() == "preserve previous fetch receipt\n"
+    warm_trace = tmp_path / "warm-trace.jsonl"
+    monkeypatch.setenv("GIT_TRACE2_EVENT", str(warm_trace))
+    warm = select(consumer, "--target", target, "--count", "5")
+    assert warm.returncode == 0, warm.stderr
+    assert warm.stdout == result.stdout
+    events = [json.loads(line) for line in warm_trace.read_text().splitlines()]
+    assert not [event for event in events
+                if event.get("event") == "start" and "fetch" in event.get("argv", [])]
 
 
 def test_older_backport_remains_eligible_without_git_ancestry(history) -> None:
@@ -202,20 +259,31 @@ def test_same_version_with_newer_release_date_is_excluded(history) -> None:
     assert "v2026.8.27" not in json.loads(result.stdout)
 
 
+@pytest.mark.parametrize("partial", [False, True])
 @pytest.mark.parametrize("metadata", [
+    None,
     "__version__ = 'invalid'\n__release_date__ = '2026.8.27'\n",
     "__version__ = '0.20.0'\n__release_date__ = '2026.13.27'\n",
     "__version__ = '0.20.0'\n",
     "__version__ = '0.20.0'\n__version__ = '0.1.0'\n__release_date__ = '2026.8.27'\n",
     "__version__ = __import__('pathlib').Path('EXECUTED').touch()\n__release_date__ = '2026.8.27'\n",
 ])
-def test_invalid_metadata_fails_closed_without_execution_or_partial_matrix(history, metadata) -> None:
+def test_invalid_metadata_fails_closed_without_execution_or_partial_matrix(history, metadata, partial, tmp_path) -> None:
     repo, target = history
-    (repo / "hermes_cli/__init__.py").write_text(metadata)
+    if metadata is None:
+        (repo / "hermes_cli/__init__.py").unlink()
+    else:
+        (repo / "hermes_cli/__init__.py").write_text(metadata)
     git(repo, "add", "hermes_cli/__init__.py")
     git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
         "-c", "commit.gpgsign=false", "commit", "-qm", "invalid release metadata fixture")
     git(repo, "tag", "v2026.8.30")
+    if partial:
+        git(repo, "config", "uploadpack.allowFilter", "true")
+        consumer = tmp_path / "invalid-consumer"
+        subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout",
+                        repo.as_uri(), str(consumer)], check=True, capture_output=True)
+        repo = consumer
     result = select(repo, "--target", target)
     assert result.returncode != 0
     assert not result.stdout.strip()
