@@ -164,7 +164,9 @@ def exercise_candidate(repo, remote, output, route, case, operation):
             recovered = work / "recovered"
             recovered.mkdir()
             git(recovered, "init")
-            git(recovered, "fetch", str(repo), base)
+            # Installed candidates are shallow clones; preserve their boundary
+            # when importing the prerequisite history into a fresh repository.
+            git(recovered, "fetch", "--update-shallow", str(repo), base)
             git(recovered, "bundle", "verify", str(output / bundle["bundle"]))
             git(recovered, "fetch", str(output / bundle["bundle"]), bundle["ref"])
             git(recovered, "checkout", "--detach", base)
@@ -330,6 +332,36 @@ def test_missing_evidence_is_not_a_pass(tmp_path):
     assert result.returncode != 0
 
 
+def test_state_command_reports_git_stderr(tmp_path):
+    repo = tmp_path / "not-a-repository"
+    repo.mkdir()
+    result = _state_command("capture", repo, tmp_path / "unused.json")
+    assert result.returncode == 1
+    assert "autostash evidence failed:" in result.stderr
+    assert "fatal: not a git repository" in result.stderr
+    assert result.stdout == ""
+
+
+def test_evidence_cli_reports_text_git_stderr(tmp_path, monkeypatch, capsys):
+    import runpy
+    import pytest
+
+    def failing_git(*args, **kwargs):
+        raise subprocess.CalledProcessError(128, ["git"], stderr="controlled Git failure\n")
+
+    monkeypatch.setattr(subprocess, "check_output", failing_git)
+    monkeypatch.setattr(sys, "argv", [
+        __file__, "--state", "capture", str(tmp_path), "data", str(tmp_path / "unused.json"),
+    ])
+    with pytest.raises(SystemExit) as result:
+        runpy.run_path(__file__, run_name="__main__")
+    assert result.value.code == 1
+    output = capsys.readouterr()
+    assert "autostash evidence failed:" in output.err
+    assert "controlled Git failure" in output.err
+    assert output.out == ""
+
+
 def test_candidate_refuses_host_execution(tmp_path, monkeypatch):
     import pytest
 
@@ -353,12 +385,18 @@ def test_candidate_refuses_host_execution(tmp_path, monkeypatch):
     assert list(outside.iterdir()) == []
 
 
-def _probe_fixture(tmp_path):
+def _probe_fixture(tmp_path, *, shallow=False):
     import shutil
 
     repo = tmp_path / "installed"
     repo.mkdir()
     _test_git(repo, "init", "--initial-branch=main")
+    if shallow:
+        # Keep a real omitted parent, so a premature checkout cannot hide
+        # missing shallow metadata from bundle verification alone.
+        (repo / "history").write_text("older history\n")
+        _test_git(repo, "add", ".")
+        _test_git(repo, "commit", "-qm", "older history")
     for rel in ("scripts/install.sh", "hermes_cli/update_cmd.py", "hermes_cli/main.py"):
         dest = repo / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -367,7 +405,12 @@ def _probe_fixture(tmp_path):
     _test_git(repo, "commit", "-qm", "candidate code snapshot")
     remote = tmp_path / "remote.git"
     _test_git(tmp_path, "clone", "--bare", str(repo), str(remote))
-    _test_git(repo, "remote", "add", "origin", str(remote))
+    if shallow:
+        repo = tmp_path / "shallow-installed"
+        _test_git(tmp_path, "clone", "--depth=1", remote.as_uri(), str(repo))
+        assert _test_git(repo, "rev-parse", "--is-shallow-repository") == "true"
+    else:
+        _test_git(repo, "remote", "add", "origin", str(remote))
     return repo, remote
 
 
@@ -401,6 +444,19 @@ def test_candidate_probe_real_git_clean_and_conflict(tmp_path):
             assert result["verified"] is True
             assert result["code_before"] == result["code_after"]
             assert result["recovered_on_original_base"] is (case == "conflict")
+
+
+def test_candidate_probe_recovers_shallow_history_with_integrity(tmp_path):
+    for route in ("update", "installer"):
+        root = tmp_path / route
+        root.mkdir()
+        repo, remote = _probe_fixture(root, shallow=True)
+        result = exercise_candidate(repo, remote, root / "evidence", route, "conflict", _local_operation)
+        assert result["verified"] is True
+        assert result["recovered_on_original_base"] is True
+        recovered = repo.parent / f".autostash-proof-{route}-conflict" / "recovered"
+        assert _test_git(recovered, "rev-parse", "--is-shallow-repository") == "true"
+        _test_git(recovered, "fsck", "--full")
 
 
 def test_probe_rejects_false_green_and_missing_stash(tmp_path):
@@ -473,4 +529,7 @@ if __name__ == "__main__":
         main()
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         print(f"autostash evidence failed: {exc}", file=sys.stderr)
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            detail = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+            print(detail.rstrip(), file=sys.stderr)
         sys.exit(1)
