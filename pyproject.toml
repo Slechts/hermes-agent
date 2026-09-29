@@ -42,6 +42,9 @@ dependencies = [
   "python-dotenv==1.2.2",
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
+  # CVE-2026-63374: TLS hostnames must use IDNA 2008, not IDNA 2003.
+  # Pin the shared HTTP/MCP transport for both locked and ordinary installs.
+  "anyio==4.14.2",
   "rich==14.3.3",
   "tenacity==9.1.4",
   "pyyaml==6.0.3",
