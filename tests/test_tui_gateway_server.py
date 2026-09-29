@@ -668,6 +668,8 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
 
+    # This test owns the build thread, not a long-lived notification poller.
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_: threading.Event())
     ready = threading.Event()
     sid = "test-sid"
     session = {
@@ -679,10 +681,21 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
     finally:
-        server._sessions.pop(sid, None)
+        # The fake's event precedes build cleanup. Join the actual owner before
+        # restoring mocks, including when startup or a test assertion raises.
+        thread = session.get("_agent_build_thread")
+        try:
+            assert thread is not None
+            thread.join(timeout=10)
+            assert not thread.is_alive(), "agent build thread did not terminate"
+        finally:
+            server._sessions.pop(sid, None)
+            server._teardown_session(session)
 
+    assert ready.is_set()
+    assert not session.get("agent_error")
+    assert built.is_set()
     assert seen == [str(profile_home)]
 
 
@@ -723,6 +736,8 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
 
+    # This test owns the build thread, not a long-lived notification poller.
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_: threading.Event())
     ready = threading.Event()
     sid = "test-secret-sid"
     session = {
@@ -734,10 +749,20 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
     finally:
-        server._sessions.pop(sid, None)
+        # Keep this test's mocks alive until the complete build has returned.
+        thread = session.get("_agent_build_thread")
+        try:
+            assert thread is not None
+            thread.join(timeout=10)
+            assert not thread.is_alive(), "agent build thread did not terminate"
+        finally:
+            server._sessions.pop(sid, None)
+            server._teardown_session(session)
 
+    assert ready.is_set()
+    assert not session.get("agent_error")
+    assert built.is_set()
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
 
 
