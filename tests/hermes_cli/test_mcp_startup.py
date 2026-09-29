@@ -6,7 +6,6 @@ from argparse import Namespace
 from contextlib import nullcontext
 import sys
 import threading
-import time
 import types
 
 import pytest
@@ -47,10 +46,16 @@ def _agent_args(**overrides) -> Namespace:
 
 def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     stop = threading.Event()
+    discovery_started = threading.Event()
+    startup_returned = threading.Event()
     calls = {"mcp": 0}
+    discovery_threads = []
+    startup_errors = []
 
     def _blocking_discover():
         calls["mcp"] += 1
+        discovery_threads.append(threading.get_ident())
+        discovery_started.set()
         stop.wait()
 
     monkeypatch.setitem(
@@ -73,7 +78,7 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     )
     # Stub mcp_oauth so the background thread doesn't pay the real (cold,
     # ~0.75s) ``tools.mcp_oauth`` import before calling discovery. This test
-    # asserts the *backgrounding contract* (main thread returns fast, discovery
+    # asserts the *backgrounding contract* (caller returns, discovery
     # runs off-thread), not OAuth suppression — the unrelated import latency
     # would otherwise blow the polling deadline on a loaded CI runner.
     monkeypatch.setitem(
@@ -87,19 +92,36 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
         types.SimpleNamespace(discover_mcp_tools=_blocking_discover),
     )
 
+    def prepare_startup():
+        try:
+            main_mod._prepare_agent_startup(_agent_args())
+        except BaseException as exc:
+            startup_errors.append(exc)
+        finally:
+            startup_returned.set()
+
+    # Verify causal independence, not a 200ms scheduler benchmark: startup
+    # must return while discovery remains blocked on a different thread.
+    caller = threading.Thread(target=prepare_startup, daemon=True)
+    caller.start()
     try:
-        start = time.monotonic()
-        main_mod._prepare_agent_startup(_agent_args())
-        elapsed = time.monotonic() - start
-        assert elapsed < 0.2
-        deadline = time.monotonic() + 3.0
-        while calls["mcp"] == 0 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        assert discovery_started.wait(timeout=3), "discovery never started"
+        assert startup_returned.wait(timeout=3), "startup waited for MCP discovery"
+        assert startup_errors == []
+        assert not stop.is_set()
         assert calls["mcp"] == 1
+        assert discovery_threads != [caller.ident]
         assert mcp_startup._mcp_discovery_thread is not None
         assert mcp_startup._mcp_discovery_thread.is_alive()
     finally:
         stop.set()
+        caller.join(timeout=3)
+        discovery_thread = mcp_startup._mcp_discovery_thread
+        if discovery_thread is not None:
+            discovery_thread.join(timeout=3)
+    assert not caller.is_alive()
+    assert discovery_thread is not None
+    assert not discovery_thread.is_alive()
 
 
 def test_background_mcp_discovery_suppresses_interactive_oauth(monkeypatch):

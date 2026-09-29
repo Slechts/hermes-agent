@@ -1335,7 +1335,12 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        bridge._poll_once(DB())
+        assert bridge.poll_events(after_cursor=0)["events"] == []
+        # utime(None) can equal the creation timestamp on coarse filesystems.
+        stat = db_path.stat()
+        os.utime(db_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        assert db_path.stat().st_mtime > bridge._state_db_mtime
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1373,7 +1378,11 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        bridge._poll_once(DB())
+        assert bridge.poll_events(after_cursor=0)["events"] == []
+        stat = db_path.stat()
+        os.utime(db_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        assert db_path.stat().st_mtime > bridge._state_db_mtime
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

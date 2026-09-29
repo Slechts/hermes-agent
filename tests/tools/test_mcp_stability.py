@@ -670,7 +670,7 @@ class TestMCPLoopDrainOnStop:
 
         def block_loop():
             blocker_started.set()
-            release_blocker.wait(timeout=5)
+            release_blocker.wait(timeout=10)
 
         with mcp_mod._lock:
             mcp_mod._servers.clear()
@@ -686,17 +686,27 @@ class TestMCPLoopDrainOnStop:
         assert blocker_started.wait(timeout=2)
 
         monkeypatch.setattr(mcp_mod, "_MCP_LOOP_DRAIN_TIMEOUT", 0.01)
-        release_timer = threading.Timer(1.2, release_blocker.set)
-        release_timer.start()
+        timeout_observations = []
+        real_warning = mcp_mod.logger.warning
+
+        def release_after_timeout(message, *args, **kwargs):
+            real_warning(message, *args, **kwargs)
+            if message.startswith("Timed out waiting for MCP loop drain"):
+                timeout_observations.append(cleanup_ran.is_set())
+                release_blocker.set()
+
+        # Resume only after the real outer wait times out. A fixed 1.2s timer
+        # races the 1.01s wait whenever the caller is descheduled beforehand.
+        monkeypatch.setattr(mcp_mod.logger, "warning", release_after_timeout)
         try:
             with caplog.at_level("WARNING", logger=mcp_mod.logger.name):
                 mcp_mod._stop_mcp_loop()
 
+            assert timeout_observations == [False]
             assert cleanup_ran.is_set(), "drain was overtaken by loop.stop"
             assert future.done(), "parked task remained pending after loop resumed"
             assert loop.is_closed()
         finally:
-            release_timer.cancel()
             release_blocker.set()
             future.cancel()
             with mcp_mod._lock:
