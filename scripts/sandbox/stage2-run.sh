@@ -47,10 +47,6 @@ if [ "$home_parent" != / ]; then
 fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
-node_env=()
-if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
-fi
 electron_env=()
 if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
   electron_env+=(
@@ -89,6 +85,53 @@ if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
 else
   USE_HOST_RUNTIME=true
 fi
+
+# Explicit overrides must remain visible after mounts. In automatic mode the
+# payload resolves headers from its actual Node, not a guessed host prefix.
+# /usr is visible with the host runtime; /usr/local is overmounted.
+# Automatic sandbox headers follow the executing Node, never the host/future Node.
+# Keep this helper identical to scripts/sandbox/stage2-run.sh (contract tested).
+configure_sandbox_node_headers() {
+    [ "${DEV_SANDBOX_AUTO_NODE_HEADERS:-}" = 1 ] || return 0
+    local node_dir
+    node_dir="$(node -e '
+        const fs = require("fs"), p = require("path");
+        const root = p.dirname(p.dirname(process.execPath));
+        try {
+            const header = fs.readFileSync(p.join(root, "include/node/node_version.h"), "utf8");
+            const version = ["MAJOR", "MINOR", "PATCH"].map(k =>
+                header.match(new RegExp("^#define NODE_" + k + "_VERSION\\s+(\\d+)", "m"))[1]
+            ).join(".");
+            if (version === process.versions.node && fs.existsSync(p.join(root, "include/node/common.gypi")))
+                process.stdout.write(root);
+        } catch (_) { /* No matching installed headers: let node-gyp resolve them. */ }
+    ' 2>/dev/null)" || node_dir=""
+    if [ -n "$node_dir" ]; then
+        export npm_config_nodedir="$node_dir"
+    else
+        unset npm_config_nodedir
+    fi
+}
+
+configure_node_env() {
+  node_env=(--setenv DEV_SANDBOX_AUTO_NODE_HEADERS 1)
+  case "${DEV_SANDBOX_NODE_DIR:-}" in
+    "$DEV_SANDBOX_HOME"/*)
+      node_env=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+      ;;
+    /usr)
+      if [ "$USE_HOST_RUNTIME" = true ]; then
+        node_env=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+      fi
+      ;;
+    /nix/*)
+      if [ "$USE_HOST_RUNTIME" = false ]; then
+        node_env=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+      fi
+      ;;
+  esac
+}
+configure_node_env
 
 runtime_mounts=()
 shim_mounts=()
@@ -226,7 +269,9 @@ exec bwrap \
   --setenv ELECTRON_DISABLE_SANDBOX 1 \
   "${node_env[@]}" \
   "${electron_env[@]}" \
-  -- "$DEV_SANDBOX_BASH" -ceu '
+  -- "$DEV_SANDBOX_BASH" -ceu "$(declare -f configure_sandbox_node_headers)
+    configure_sandbox_node_headers
+"'
     python3 /work/proxy.py /work/http /work/certs /work/certs/real-ca.pem >/work/logs/proxy.log 2>&1 &
     proxy_pid=$!
     cleanup() {

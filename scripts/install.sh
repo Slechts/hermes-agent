@@ -817,6 +817,30 @@ npm_supports_npmrc() {
     return 0
 }
 
+# Automatic sandbox headers follow the executing Node, never the host/future Node.
+# Keep this helper identical to scripts/sandbox/stage2-run.sh (contract tested).
+configure_sandbox_node_headers() {
+    [ "${DEV_SANDBOX_AUTO_NODE_HEADERS:-}" = 1 ] || return 0
+    local node_dir
+    node_dir="$(node -e '
+        const fs = require("fs"), p = require("path");
+        const root = p.dirname(p.dirname(process.execPath));
+        try {
+            const header = fs.readFileSync(p.join(root, "include/node/node_version.h"), "utf8");
+            const version = ["MAJOR", "MINOR", "PATCH"].map(k =>
+                header.match(new RegExp("^#define NODE_" + k + "_VERSION\\s+(\\d+)", "m"))[1]
+            ).join(".");
+            if (version === process.versions.node && fs.existsSync(p.join(root, "include/node/common.gypi")))
+                process.stdout.write(root);
+        } catch (_) { /* No matching installed headers: let node-gyp resolve them. */ }
+    ' 2>/dev/null)" || node_dir=""
+    if [ -n "$node_dir" ]; then
+        export npm_config_nodedir="$node_dir"
+    else
+        unset npm_config_nodedir
+    fi
+}
+
 check_node() {
     log_info "Checking Node.js (for browser tools)..."
 
@@ -833,6 +857,7 @@ check_node() {
         if ! command -v npm &> /dev/null || npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
             log_success "Node.js $(node --version) found"
             HAS_NODE=true
+            configure_sandbox_node_headers
             return 0
         fi
         log_warn "npm $(npm --version) cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
@@ -846,6 +871,7 @@ check_node() {
         export PATH="$HERMES_HOME/node/bin:$PATH"
         log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
         HAS_NODE=true
+        configure_sandbox_node_headers
         return 0
     fi
 
@@ -972,6 +998,7 @@ install_node() {
     installed_ver=$("$HERMES_HOME/node/bin/node" --version 2>/dev/null)
     log_success "Node.js $installed_ver installed to ~/.hermes/node/"
     HAS_NODE=true
+    configure_sandbox_node_headers
 }
 
 check_network_prerequisites() {
@@ -1264,8 +1291,20 @@ clone_repo() {
                 local stash_name
                 stash_name="hermes-install-autostash-$(date -u +%Y%m%d-%H%M%S)"
                 log_info "Local changes detected, stashing before update..."
-                git stash push --include-untracked -m "$stash_name"
-                autostash_ref="stash@{0}"
+                local previous_stash=""
+                previous_stash="$(git rev-parse --verify refs/stash 2>/dev/null)" || previous_stash=""
+                if ! git stash push --include-untracked -m "$stash_name"; then
+                    log_error "Could not completely stash local changes; repository update aborted."
+                    log_warn "Review git status and git stash list before retrying; no update was attempted."
+                    return 1
+                fi
+                # Save the object, not a positional selector that another stash
+                # can move while the fetch/pull is running.
+                if ! autostash_ref="$(git rev-parse --verify refs/stash)" \
+                    || [ -z "$autostash_ref" ] || [ "$autostash_ref" = "$previous_stash" ]; then
+                    log_error "Could not verify the new autostash; repository update aborted."
+                    return 1
+                fi
             fi
 
             # Fetch only the target branch. A bare `git fetch origin` pulls
@@ -1302,19 +1341,52 @@ clone_repo() {
                     log_info "Restoring local changes..."
                     local restore_output=""
                     local restore_ok="yes"
-                    if restore_output="$(git stash apply "$autostash_ref" 2>&1)"; then
+                    if restore_output="$(git stash apply --index "$autostash_ref" 2>&1)"; then
                         restore_ok="yes"
                     else
                         restore_ok="no"
                     fi
                     local conflicted_files=""
-                    conflicted_files="$(git diff --name-only --diff-filter=U || true)"
-                    if [ "$restore_ok" = "yes" ] && [ -z "$conflicted_files" ]; then
-                        git stash drop "$autostash_ref" >/dev/null
+                    local conflict_check_ok="yes"
+                    conflicted_files="$(git diff --name-only --diff-filter=U)" || conflict_check_ok="no"
+                    if [ "$conflict_check_ok" = "no" ]; then
+                        log_warn "Could not verify the index for conflicts; restoration is unverified."
+                        log_info "Stash preserved: $autostash_ref; no cleanup was attempted."
+                        log_info "Review git status before recovery: git stash apply --index $autostash_ref"
+                    elif [ "$restore_ok" = "yes" ] && [ -z "$conflicted_files" ]; then
+                        local stash_entries="" stash_selector="" selector oid
+                        if stash_entries="$(git stash list --format='%gd %H')"; then
+                            while read -r selector oid; do
+                                if [ "$oid" = "$autostash_ref" ]; then
+                                    stash_selector="$selector"
+                                    break
+                                fi
+                            done <<< "$stash_entries"
+                        fi
+                        # Recheck identity before dropping. Concurrent Git
+                        # writers still require user coordination (no atomic
+                        # compare-and-drop operation exists for stash selectors).
+                        if [ -n "$stash_selector" ] \
+                            && [ "$(git rev-parse --verify "$stash_selector" 2>/dev/null)" = "$autostash_ref" ] \
+                            && git stash drop "$stash_selector" >/dev/null; then
+                            :
+                        else
+                            log_warn "Local changes restored, but the stash was left in place: $autostash_ref"
+                            log_info "Review git status and git stash list before removing it; do not apply it twice."
+                        fi
                         log_warn "Local changes were restored on top of the updated codebase."
                         log_warn "Review git diff / git status if Hermes behaves unexpectedly."
+                    elif [ -z "$conflicted_files" ] \
+                        && [[ "$restore_output" == *"could not restore untracked files from stash"* ]]; then
+                        # A file may have appeared/changed while updating. Keep
+                        # both the current file and the saved version reachable.
+                        log_warn "Untracked files could not be restored; restoration is incomplete."
+                        printf '%s\n' "$restore_output"
+                        log_info "Stash preserved: $autostash_ref; current files were not reset."
+                        log_info "Review git status, git diff and git diff --cached before retrying."
+                        log_info "Manual recovery command: git stash apply --index $autostash_ref"
                     else
-                        log_error "Update pulled new code, but restoring local changes hit conflicts."
+                        log_error "Update pulled new code, but restoring local changes failed or hit conflicts."
                         if [ -n "$restore_output" ]; then
                             printf '%s\n' "$restore_output"
                         fi
@@ -1327,16 +1399,21 @@ $conflicted_files
 EOF
                         fi
                         printf '\n'
-                        log_info "Your stashed changes are preserved — nothing is lost."
+                        log_info "Your stashed changes are preserved for manual recovery."
                         log_info "  Stash ref: $autostash_ref"
-                        git reset --hard HEAD >/dev/null 2>&1 || true
-                        log_info "Working tree reset to clean state."
-                        log_info "Restore your changes later with: git stash apply $autostash_ref"
+                        if git reset --hard HEAD >/dev/null 2>&1; then
+                            log_info "Tracked files and index reset to HEAD; untracked files may remain."
+                        else
+                            log_warn "Could not reset tracked files and index; conflicts may remain."
+                        fi
+                        log_info "Review git status before attempting recovery."
+                        log_info "Manual recovery command: git stash apply --index $autostash_ref"
+                        log_info "Reapplying on the updated code may conflict again; keep the stash until verified."
                     fi
                 else
                     log_info "Skipped restoring local changes."
                     log_info "Your changes are still preserved in git stash."
-                    log_info "Restore manually with: git stash apply $autostash_ref"
+                    log_info "Restore manually with: git stash apply --index $autostash_ref"
                 fi
             fi
         else
@@ -1578,7 +1655,22 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        # UV_NO_CONFIG must keep ignoring unrelated user/ancestor configuration,
+        # but it also hides this project's resolver policy (e.g. exclude-newer),
+        # making a valid lock appear stale. Explicit config bypasses discovery,
+        # not lock/hash verification. Do not regenerate the lock or use --frozen.
+        local uv_project_config sync_status=0
+        uv_project_config="$(mktemp)" || { log_error "Cannot create uv config"; exit 1; }
+        if ! "$PYTHON_PATH" "$INSTALL_DIR/scripts/uv_project_config.py" \
+            "$INSTALL_DIR/pyproject.toml" > "$uv_project_config"; then
+            rm -f -- "$uv_project_config"
+            log_error "Cannot read the project's uv configuration"
+            exit 1
+        fi
+        UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" "$UV_CMD" sync \
+            --config-file "$uv_project_config" --extra all --locked || sync_status=$?
+        rm -f -- "$uv_project_config"
+        if [ "$sync_status" -eq 0 ]; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -2288,10 +2380,13 @@ install_node_deps() {
         cd "$INSTALL_DIR"
         # Time-boxed: a stalled registry fetch would otherwise hang here with no
         # progress (same #39219 stall class as the desktop build below).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+        # Install only the root/browser dependencies, not every workspace
+        # (notably Desktop). TUI is installed separately from its own directory.
+        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --workspaces=false; then
+            log_success "Node.js dependencies installed"
+        else
             log_warn "npm install failed or timed out (browser tools may not work)"
-        }
-        log_success "Node.js dependencies installed"
+        fi
 
         # Install Playwright browser + system dependencies.
         # Playwright's --with-deps only supports apt-based systems natively.
@@ -2390,10 +2485,11 @@ install_node_deps() {
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install; then
+            log_success "TUI dependencies installed"
+        else
             log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
-        }
-        log_success "TUI dependencies installed"
+        fi
     fi
 
     # Keep the checkout clean so `hermes update` doesn't autostash every run.

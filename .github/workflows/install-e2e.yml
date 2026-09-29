@@ -115,3 +115,27 @@ jobs:
     with:
       route: installer
       install-ref: ${{ matrix.install-ref }}
+
+  # Separate fresh installs prove the candidate's own implementation, not the
+  # historical CLI which was already loaded before it pulled the candidate.
+  candidate-update:
+    if: github.event_name != 'workflow_dispatch' || inputs.route != 'installer'
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [clean, conflict]
+    uses: ./.github/workflows/install-e2e-run.yml
+    with:
+      route: update
+      candidate-case: ${{ matrix.case }}
+
+  candidate-installer:
+    if: github.event_name != 'workflow_dispatch' || inputs.route != 'update'
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [clean, conflict]
+    uses: ./.github/workflows/install-e2e-run.yml
+    with:
+      route: installer
+      candidate-case: ${{ matrix.case }}

@@ -129,8 +129,57 @@ def release_key(ref):
     return tuple(map(int, version.split("."))), date_parts + (0,) * (4 - len(date_parts))
 
 
+def prefetch_release_metadata():
+    # blob:none clones otherwise fetch one tiny metadata blob per `git show`.
+    # Warm only the release metadata, without fetching trees/worktrees or
+    # changing refs. Ordinary (fully hydrated) repositories stay offline.
+    remotes = subprocess.run(["git", "-C", repo, "remote"],
+                             check=True, capture_output=True, text=True).stdout.splitlines()
+    promisors = []
+    for remote in remotes:
+        setting = subprocess.run(
+            ["git", "-C", repo, "config", "--bool", "--get", f"remote.{remote}.promisor"],
+            capture_output=True, text=True,
+        )
+        if setting.returncode == 0 and setting.stdout.strip() == "true":
+            promisors.append(remote)
+    if not promisors:
+        return
+    expressions = [f"refs/tags/{tag}:hermes_cli/__init__.py" for tag in tags]
+    objects = set(subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--revs-only", "--end-of-options", *expressions],
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines())
+
+    def missing_objects():
+        # --batch-all-objects inspects stored objects only: unlike an ordinary
+        # cat-file existence check, it cannot trigger another lazy fetch.
+        present = subprocess.run(
+            ["git", "-C", repo, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        return sorted(objects.difference(present))
+
+    for remote in promisors:
+        missing = missing_objects()
+        if not missing:
+            return
+        subprocess.run(
+            ["git", "-C", repo, "-c", "fetch.negotiationAlgorithm=noop", "fetch",
+             "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no",
+             "--filter=blob:none", "--stdin", "--", remote],
+            input="\n".join(missing) + "\n", capture_output=True, text=True,
+        )
+    # A promisor need not own every requested object (e.g. independent forks).
+    # Bulk hydration is an optimization, never a replacement for the strict
+    # per-ref reads below. Preserve Git's individual fallback across remotes.
+    if missing_objects():
+        print("Release metadata bulk fetch incomplete; using individual Git reads", file=sys.stderr)
+
+
 try:
     target_key = release_key(target)
+    prefetch_release_metadata()
     eligible = []
     for tag in tags:
         if release_key(f"refs/tags/{tag}") > target_key:

@@ -9,6 +9,9 @@
 # canonical install.sh URL, and a git-upload-pack shim standing in for
 # github.com -- so `install.sh` really installs uv, a managed Python, Node and
 # the venv, cloning "github.com" over the ssh-first path a user hits.
+# This is historical upgrade compatibility, NOT proof that the candidate's
+# autostash implementation ran: the old CLI may already be loaded in memory.
+# autostash-candidate-e2e.sh provides the independent candidate-executed proof.
 #
 # One route per run, on a sandbox built from scratch, because the routes are only
 # meaningful from a pristine install. Sharing one install across routes -- or
@@ -159,7 +162,7 @@ rm -rf -- "$SANDBOX_ROOT"
 # and argparse prints every option it accepts.
 update_supports() {
   local flag="$1"
-  in_sandbox "hermes update --help 2>&1" | grep -qF -- "$flag"
+  in_sandbox "hermes update --help 2>&1" | grep -F -- "$flag" > /dev/null
 }
 
 # Does the installer at REF accept FLAG? Read it out of that ref's own
@@ -179,7 +182,9 @@ installer_supports() {
     git fetch -q --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
     script="$(git show FETCH_HEAD:scripts/install.sh 2>/dev/null)" || return 1
   }
-  printf '%s' "$script" | grep -qF -- "$flag"
+  # Drain the producer: grep -q exits early, so a large installer triggers
+  # SIGPIPE in printf and pipefail turns a present flag into a false negative.
+  printf '%s' "$script" | grep -F -- "$flag" > /dev/null
 }
 
 # Run the real install one-liner inside the sandbox. `ref` non-empty installs
@@ -215,18 +220,38 @@ install_in_sandbox() {
   # tee's status and a failed install looks like a pass.
   local status=0
   "${SANDBOX[@]}" "${args[@]}" 2>&1 | tee "$log" || status=$?
+  # Optional dependency failures can still return zero and print Complete.
+  # Capture diagnostics on success too, before any next sandbox invocation.
+  collect_sandbox_logs "$tag"
 
+  if [ "$tag" = reinstall ]; then
+    capture_update_evidence after-installer
+  fi
   if [ "$status" -ne 0 ]; then
-    collect_sandbox_logs "$tag"
     fail "$what failed (exit $status)"
   fi
   grep -q 'Installation Complete' "$log" \
-    || { collect_sandbox_logs "$tag"; \
-         fail "$what did not report a completed install"; }
+    || fail "$what did not report a completed install"
   ok "$what completed (log: $log)"
 }
 
 in_sandbox() { "${SANDBOX[@]}" --persistent bash -lc "$1"; }
+
+# Preserve source identities, index/worktree patches and referenced stash
+# objects even when an old updater returns zero after an incomplete restore.
+# Bundles record their base prerequisite; recovery is not automatic merging.
+capture_update_evidence() {
+  local tag="$1"
+  in_sandbox "python3 /work/repo/tests/install/test_autostash_candidate_e2e.py --history $INSTALL_DIR /work/logs/autostash-$tag"
+  collect_sandbox_logs "$tag"
+}
+
+run_in_sandbox_logged() {
+  local command="$1" tag="$2" status=0
+  in_sandbox "$command" 2>&1 | tee "$LOG_DIR/$tag.log" || status=$?
+  collect_sandbox_logs "$tag"
+  return "$status"
+}
 
 # fake main's SHA is read fresh whenever it is needed, never cached across a
 # sandbox invocation: each invocation re-derives it from the worktree.
@@ -251,6 +276,16 @@ require_hermes_works() {
   ok "hermes runs $when"
 }
 
+# A correct HEAD and working CLI do not prove that autostash reapplied cleanly.
+# Fail rather than discard user changes or silently resolve a lockfile conflict.
+require_no_unmerged_paths() {
+  local what="$1" unmerged
+  unmerged="$(in_sandbox "cd $INSTALL_DIR && git diff --name-only --diff-filter=U")" \
+    || fail "could not inspect unmerged paths after $what"
+  [ -z "$unmerged" ] || fail "$what left unresolved merge conflicts: $unmerged"
+  ok "$what has no unresolved merge conflicts"
+}
+
 # ── install the earlier Hermes ─────────────────────────────────────────────
 step "installing upstream $INSTALL_REF (real curl | install.sh: uv, Python, Node, venv)"
 install_in_sandbox "install of upstream $INSTALL_REF" "$INSTALL_REF" install
@@ -262,6 +297,7 @@ TARGET="$(sandbox_target)"
   || fail "install landed on the update target ($BASE); base and target must differ"
 ok "installed ${BASE:0:12}; update target is ${TARGET:0:12}"
 require_hermes_works 'after install'
+capture_update_evidence before-update
 
 # ── apply exactly one update route ─────────────────────────────────────────
 case "$ROUTE" in
@@ -275,12 +311,14 @@ case "$ROUTE" in
     else
       update_cmd="hermes update </dev/null"
     fi
-    if ! in_sandbox "cd $INSTALL_DIR && $update_cmd"; then
-      collect_sandbox_logs update
-      fail "hermes update failed ($update_cmd)"
-    fi
+    update_status=0
+    run_in_sandbox_logged "cd $INSTALL_DIR && $update_cmd" update || update_status=$?
+    capture_update_evidence after-update
+    [ "$update_status" -eq 0 ] \
+      || fail "hermes update failed (exit $update_status; $update_cmd)"
     require_landed_on_target 'hermes update'
     require_hermes_works 'after hermes update'
+    require_no_unmerged_paths 'hermes update'
     ;;
   installer)
     step 'ROUTE: installer re-run over the existing checkout'
@@ -289,6 +327,7 @@ case "$ROUTE" in
     install_in_sandbox 'installer re-run' '' reinstall
     require_landed_on_target 'installer re-run'
     require_hermes_works 'after installer re-run'
+    require_no_unmerged_paths 'installer re-run'
     ;;
 esac
 
