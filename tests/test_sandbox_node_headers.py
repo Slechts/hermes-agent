@@ -47,16 +47,41 @@ def capture_stage2(tmp_path: Path, home: str, node_dir: str) -> list[str]:
     bwrap = tools / 'bwrap'
     bwrap.write_text('#!/bin/sh\nprintf "%s\\0" "$@" > "$CAPTURE"\n')
     bwrap.chmod(0o755)
+    # This fixture captures argv, not filesystem preparation or mount semantics.
+    # Copying the host /etc here adds unrelated I/O (and may copy private files).
+    # Record every cp call so an unexpected extra operation still fails loudly.
+    copy_capture = tmp_path / 'cp-args'
+    cp = tools / 'cp'
+    cp.write_text('#!/bin/sh\nprintf "%s\\0" "$@" >> "$COPY_CAPTURE"\n')
+    cp.chmod(0o755)
     env = {'PATH': f'{tools}:' + os.environ['PATH'], 'CAPTURE': str(capture),
+           'COPY_CAPTURE': str(copy_capture),
            'DEV_SANDBOX_ROOT': str(root), 'DEV_SANDBOX_BASH': '/usr/bin/bash',
            'DEV_SANDBOX_INTERACTIVE': 'false', 'DEV_SANDBOX_USER': 'hermes',
            'DEV_SANDBOX_HOME': home, 'DEV_SANDBOX_NODE_DIR': node_dir}
     subprocess.run(['bash', str(STAGE2), 'true'], env=env, check=True,
                    text=True, capture_output=True, timeout=20)
+    assert copy_capture.read_bytes().split(b'\0') == [
+        b'-a', b'/etc/.', os.fsencode(str(root / 'etc-merged') + '/'), b'']
     args = capture.read_bytes().rstrip(b'\0').decode().split('\0')
     assert '--unshare-pid' in args and '--clearenv' in args and '--die-with-parent' in args
     assert ('--bind', str(root / 'root/usr/local'), '/usr/local') in zip(args, args[1:], args[2:])
     return args
+
+
+def test_argv_capture_does_not_invoke_host_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A host cp may be slow or read private files; neither belongs in an argv test.
+    host_tools = tmp_path / 'host tools'
+    host_tools.mkdir()
+    invoked = host_tools / 'invoked'
+    host_cp = host_tools / 'cp'
+    host_cp.write_text('#!/bin/sh\nprintf "called\\n" > "$(dirname "$0")/invoked"\n')
+    host_cp.chmod(0o755)
+    monkeypatch.setenv('PATH', str(host_tools) + os.pathsep + os.environ['PATH'])
+
+    capture_stage2(tmp_path, '/home/hermes', '')
+
+    assert not invoked.exists(), 'argv capture must not call the host cp'
 
 
 @pytest.mark.parametrize('home,node_dir,expected', [
